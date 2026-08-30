@@ -1,0 +1,509 @@
+# Reusable SonarQube scan: PR vs branch parameters, coverage download, CE wait,
+# optional issue gate, official quality-gate action, and an optional sticky PR comment.
+#
+# Callers must grant `actions: read`, `contents: read`, and (for PR comments)
+# `pull-requests: write` on the job that `uses:` this workflow. Secrets and the
+# `SONAR_HOST_URL` variable come from the caller via `secrets: inherit`.
+#
+# Adapted from black-flag-collective/action-workflows. Do not pin
+# sonarqube-quality-gate-action to v1.3.1 — that tag does not exist.
+
+name: SonarQube Scan
+
+on:
+  workflow_call:
+    inputs:
+      runner-labels-json:
+        description: >-
+          JSON array (or string) for runs-on. Default keeps GitHub-hosted
+          ubuntu-latest so existing consumers are unaffected.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      fetch-depth:
+        description: Git fetch depth for checkout; 0 disables shallow clone (recommended for Sonar).
+        required: false
+        type: number
+        default: 0
+      checkout-ref:
+        description: Git ref to checkout (commit SHA or branch). Empty uses the default ref for the event.
+        required: false
+        type: string
+        default: ""
+      coverage-artifacts-json:
+        description: >-
+          JSON array of {"name":"<GitHub artifact name>","path":"<repo-relative dir>"}.
+          Empty skips all coverage downloads. Non-empty downloads each artifact before scan.
+        required: false
+        type: string
+        default: ""
+      coverage-artifacts-run-id:
+        description: >-
+          Workflow run ID to download coverage artifacts from. Empty uses the current workflow run.
+        required: false
+        type: string
+        default: ""
+      pre-sonar-command:
+        description: >-
+          Optional shell command after checkout and coverage download, before Sonar scanner
+          (e.g. node scripts/generate-sonar-coverage-exclusions.mjs).
+        required: false
+        type: string
+        default: ""
+      use-pull-request-scan:
+        description: Use sonar.pullrequest.* parameters (Community branch plugin PR decoration).
+        required: false
+        type: boolean
+        default: false
+      pull-request-key:
+        description: PR number for sonar.pullrequest.key when use-pull-request-scan is true.
+        required: false
+        type: string
+        default: ""
+      pull-request-branch:
+        description: Head branch for sonar.pullrequest.branch.
+        required: false
+        type: string
+        default: ""
+      pull-request-base:
+        description: Base branch for sonar.pullrequest.base.
+        required: false
+        type: string
+        default: ""
+      scm-revision:
+        description: Commit SHA for sonar.scm.revision (PR scans).
+        required: false
+        type: string
+        default: ""
+      branch-name:
+        description: Branch name for sonar.branch.name when use-pull-request-scan is false.
+        required: false
+        type: string
+        default: ""
+      issue-gate-scope:
+        description: >-
+          Extra unresolved-issue API gate after CE processing. all-open = fail on any unresolved
+          issue on the PR/branch (default). new-code = fail on unresolved issues in new code
+          (inNewCodePeriod). off = Quality Gate only (no API issue gate).
+        required: false
+        type: string
+        default: all-open
+      enforce-quality-gate:
+        description: >-
+          Run the official sonarqube-quality-gate-action after diagnostics. Set false for
+          baselined repos that still need scan uploads and Quality Gate diagnostics without
+          failing the GitHub workflow on the project gate.
+        required: false
+        type: boolean
+        default: true
+      enforce-zero-open-issues:
+        description: >-
+          Deprecated — use issue-gate-scope. When true and issue-gate-scope is off, behaves as
+          all-open.
+        required: false
+        type: boolean
+        default: false
+      post-pr-comment:
+        description: >-
+          When true and this is a pull-request scan, upsert a sticky PR comment with quality-gate
+          status, unresolved issues for issue-gate-scope, and the Sonar dashboard URL. Callers must
+          grant pull-requests: write or this step fails closed. Skipped on branch/main scans.
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  sonarqube:
+    runs-on: ${{ fromJSON(inputs.runner-labels-json) }}
+    timeout-minutes: 15
+    # Intersection with the caller: the caller must also grant pull-requests: write
+    # or the sticky-comment step fails closed.
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+          ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
+
+      - name: Download coverage artifacts
+        if: inputs.coverage-artifacts-json != '' && inputs.coverage-artifacts-json != '[]'
+        env:
+          COVERAGE_ARTIFACTS_JSON: ${{ inputs.coverage-artifacts-json }}
+          COVERAGE_ARTIFACTS_RUN_ID: ${{ inputs.coverage-artifacts-run-id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if ! echo "$COVERAGE_ARTIFACTS_JSON" | jq -e 'type == "array" and length > 0' >/dev/null; then
+            echo "coverage-artifacts-json must be a non-empty JSON array." >&2
+            exit 1
+          fi
+
+          if [ -n "$COVERAGE_ARTIFACTS_RUN_ID" ]; then
+            RUN_ID="$COVERAGE_ARTIFACTS_RUN_ID"
+          else
+            RUN_ID="$GITHUB_RUN_ID"
+          fi
+
+          succeeded=0
+          failed=0
+          while IFS= read -r item; do
+            name=$(echo "$item" | jq -r '.name')
+            path=$(echo "$item" | jq -r '.path')
+            if [ -z "$name" ] || [ "$name" = "null" ] || [ -z "$path" ] || [ "$path" = "null" ]; then
+              echo "::warning::Skipping invalid coverage artifact entry: ${item}"
+              failed=$((failed + 1))
+              continue
+            fi
+            mkdir -p "$path"
+            if gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n "$name" -D "$path"; then
+              echo "Downloaded artifact ${name} to ${path}"
+              succeeded=$((succeeded + 1))
+            else
+              echo "::warning::Failed to download artifact ${name} (run ${RUN_ID}) to ${path}"
+              failed=$((failed + 1))
+            fi
+          done < <(echo "$COVERAGE_ARTIFACTS_JSON" | jq -c '.[]')
+
+          if [ "$succeeded" -eq 0 ]; then
+            # Artifact downloads are transiently flaky (expired/missing artifacts).
+            # Continue without coverage instead of failing the scan.
+            echo "::warning::No coverage artifacts downloaded (${failed} failed); continuing without coverage."
+          fi
+
+      - name: Pre-Sonar command
+        if: inputs.pre-sonar-command != ''
+        run: ${{ inputs.pre-sonar-command }}
+
+      - name: Apply generated Sonar coverage properties
+        if: hashFiles('sonar-project.coverage.generated.properties') != ''
+        run: cat sonar-project.coverage.generated.properties >> sonar-project.properties
+
+      # Community Edition + sonarqube-community-branch-plugin requires explicit pull-request
+      # parameters (and sonar.scm.revision on GitHub). Do not set sonar.branch.* on PR scans.
+      # https://github.com/mc1arke/sonarqube-community-branch-plugin#how-to-decorate-a-pull-request
+      # The scanner engine occasionally fails transiently (EXECUTION FAILURE / exit 3).
+      # Each scan step gets a single retry: the first attempt uses continue-on-error,
+      # and the retry step only runs when the first attempt failed.
+      - name: SonarQube Scan (pull request)
+        id: scan-pr
+        if: inputs.use-pull-request-scan
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v8.1.0
+        with:
+          args: >-
+            -Dsonar.pullrequest.key=${{ inputs.pull-request-key }}
+            -Dsonar.pullrequest.branch=${{ inputs.pull-request-branch }}
+            -Dsonar.pullrequest.base=${{ inputs.pull-request-base }}
+            -Dsonar.scm.revision=${{ inputs.scm-revision }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: SonarQube Scan (pull request, retry)
+        if: inputs.use-pull-request-scan && steps.scan-pr.outcome == 'failure'
+        uses: SonarSource/sonarqube-scan-action@v8.1.0
+        with:
+          args: >-
+            -Dsonar.pullrequest.key=${{ inputs.pull-request-key }}
+            -Dsonar.pullrequest.branch=${{ inputs.pull-request-branch }}
+            -Dsonar.pullrequest.base=${{ inputs.pull-request-base }}
+            -Dsonar.scm.revision=${{ inputs.scm-revision }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: SonarQube Scan (branch)
+        id: scan-branch
+        if: ${{ !inputs.use-pull-request-scan }}
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v8.1.0
+        with:
+          args: >-
+            -Dsonar.branch.name=${{ inputs.branch-name }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: SonarQube Scan (branch, retry)
+        if: ${{ !inputs.use-pull-request-scan && steps.scan-branch.outcome == 'failure' }}
+        uses: SonarSource/sonarqube-scan-action@v8.1.0
+        with:
+          args: >-
+            -Dsonar.branch.name=${{ inputs.branch-name }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: Resolve Sonar issue gate scope
+        id: issue-gate-scope
+        run: |
+          set -euo pipefail
+          scope="${{ inputs.issue-gate-scope }}"
+          case "$scope" in
+            off|new-code|all-open) ;;
+            *)
+              echo "issue-gate-scope must be off, new-code, or all-open (got: ${scope})" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$scope" = "off" ] && [ "${{ inputs.enforce-zero-open-issues }}" = "true" ]; then
+            echo "::notice::enforce-zero-open-issues is deprecated; using issue-gate-scope=all-open"
+            scope="all-open"
+          fi
+          echo "effective=${scope}" >> "$GITHUB_OUTPUT"
+          echo "Sonar issue gate scope: ${scope}"
+
+      - name: Wait for SonarQube background task
+        id: sonar-ce-wait
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f .scannerwork/report-task.txt ]; then
+            echo "No SonarQube report-task.txt found; skipping CE wait."
+            exit 0
+          fi
+
+          ce_task_id=$(awk -F= '$1 == "ceTaskId" {print $2; exit}' .scannerwork/report-task.txt)
+          if [ -z "$ce_task_id" ]; then
+            echo "No SonarQube ceTaskId found; skipping CE wait."
+            exit 0
+          fi
+
+          api_base="${SONAR_HOST_URL%/}/api"
+          analysis_id=""
+          for _ in $(seq 1 120); do
+            task_json=$(curl -fsS -u "${SONAR_TOKEN}:" "${api_base}/ce/task?id=${ce_task_id}")
+            task_status=$(echo "$task_json" | jq -r '.task.status')
+            if [ "$task_status" = "SUCCESS" ]; then
+              analysis_id=$(echo "$task_json" | jq -r '.task.analysisId')
+              break
+            fi
+            if [ "$task_status" = "FAILED" ] || [ "$task_status" = "CANCELED" ]; then
+              echo "SonarQube background task ended with status ${task_status}."
+              echo "$task_json" | jq -r '.task.errorMessage // empty'
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if [ -z "$analysis_id" ] || [ "$analysis_id" = "null" ]; then
+            echo "SonarQube background task did not finish before timeout." >&2
+            exit 1
+          fi
+
+          echo "analysis_id=${analysis_id}" >> "$GITHUB_OUTPUT"
+
+      - name: SonarQube Issue Gate
+        if: steps.issue-gate-scope.outputs.effective != 'off'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          USE_PULL_REQUEST_SCAN: ${{ inputs.use-pull-request-scan }}
+          SONAR_PULL_REQUEST: ${{ inputs.pull-request-key }}
+          SONAR_BRANCH_NAME: ${{ inputs.branch-name }}
+          ISSUE_GATE_SCOPE: ${{ steps.issue-gate-scope.outputs.effective }}
+        run: |
+          set -euo pipefail
+
+          project_key=$(awk -F= '$1 == "sonar.projectKey" {print $2; exit}' sonar-project.properties)
+          if [ -z "$project_key" ]; then
+            echo "sonar.projectKey is missing from sonar-project.properties" >&2
+            exit 1
+          fi
+
+          base_url="${SONAR_HOST_URL%/}/api/issues/search"
+          new_code_param=()
+          if [ "$ISSUE_GATE_SCOPE" = "new-code" ]; then
+            new_code_param=(--data-urlencode "inNewCodePeriod=true")
+          fi
+
+          if [ "$USE_PULL_REQUEST_SCAN" = "true" ]; then
+            issues_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
+              --get "$base_url" \
+              --data-urlencode "componentKeys=${project_key}" \
+              --data-urlencode "pullRequest=${SONAR_PULL_REQUEST}" \
+              --data-urlencode "resolved=false" \
+              "${new_code_param[@]}" \
+              --data-urlencode "ps=100")
+            scope="PR ${SONAR_PULL_REQUEST} (${ISSUE_GATE_SCOPE})"
+          else
+            issues_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
+              --get "$base_url" \
+              --data-urlencode "componentKeys=${project_key}" \
+              --data-urlencode "branch=${SONAR_BRANCH_NAME}" \
+              --data-urlencode "resolved=false" \
+              "${new_code_param[@]}" \
+              --data-urlencode "ps=100")
+            scope="${SONAR_BRANCH_NAME} (${ISSUE_GATE_SCOPE})"
+          fi
+
+          total=$(echo "$issues_json" | jq -r '.total')
+          echo "SonarQube unresolved issue count for ${project_key}/${scope}: ${total}"
+          if [ "$total" -ne 0 ]; then
+            echo "$issues_json" | jq -r '.issues[] | "- \(.severity) \(.type) \(.component):\(.line // "-") \(.message)"'
+            exit 1
+          fi
+
+      - name: SonarQube Quality Gate Diagnostics
+        if: steps.sonar-ce-wait.outputs.analysis_id != ''
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          ANALYSIS_ID: ${{ steps.sonar-ce-wait.outputs.analysis_id }}
+        run: |
+          set -euo pipefail
+
+          api_base="${SONAR_HOST_URL%/}/api"
+          gate_json=$(curl -fsS -u "${SONAR_TOKEN}:" "${api_base}/qualitygates/project_status?analysisId=${ANALYSIS_ID}")
+          echo "$gate_json" | jq -r '.projectStatus | "SonarQube quality gate status: \(.status)"'
+          echo "$gate_json" | jq -r '.projectStatus.conditions[]? | "- \(.metricKey): \(.status) actual=\(.actualValue // "-") threshold=\(.comparator // "") \(.errorThreshold // "-")"'
+
+      - name: SonarQube Quality Gate check
+        if: inputs.enforce-quality-gate
+        id: sonarqube-quality-gate-check
+        uses: sonarsource/sonarqube-quality-gate-action@v1.2.1
+        with:
+          pollingTimeoutSec: 600
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      # Official quality-gate-action does not post GitHub comments. Upsert a sticky
+      # note even when earlier gate steps failed so reviewers still see status + URL.
+      - name: Post sticky SonarQube PR comment
+        if: ${{ always() && inputs.use-pull-request-scan && inputs.post-pr-comment }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          PR_NUMBER: ${{ inputs.pull-request-key }}
+          ISSUE_GATE_SCOPE: ${{ steps.issue-gate-scope.outputs.effective || inputs.issue-gate-scope }}
+          ANALYSIS_ID: ${{ steps.sonar-ce-wait.outputs.analysis_id }}
+          QG_ACTION_STATUS: ${{ steps.sonarqube-quality-gate-check.outputs.quality-gate-status }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::use-pull-request-scan is true but pull-request-key is empty; cannot post a PR comment."
+            exit 1
+          fi
+
+          project_key=""
+          if [ -f sonar-project.properties ]; then
+            project_key=$(awk -F= '$1 == "sonar.projectKey" {print $2; exit}' sonar-project.properties)
+          fi
+
+          host="${SONAR_HOST_URL%/}"
+          qg_status="${QG_ACTION_STATUS:-UNKNOWN}"
+          issue_total="unknown"
+          issue_lines=""
+          dashboard_url=""
+
+          # Prefer the analysis-id query (exact scan) then fall back to the PR
+          # project_status endpoint so a red gate still produces a useful comment.
+          if [ -n "$host" ] && [ -n "$SONAR_TOKEN" ]; then
+            api_base="${host}/api"
+            gate_json=""
+            if [ -n "$ANALYSIS_ID" ]; then
+              gate_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
+                "${api_base}/qualitygates/project_status?analysisId=${ANALYSIS_ID}" || true)
+            fi
+            if [ -z "$gate_json" ] && [ -n "$project_key" ]; then
+              gate_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
+                --get "${api_base}/qualitygates/project_status" \
+                --data-urlencode "projectKey=${project_key}" \
+                --data-urlencode "pullRequest=${PR_NUMBER}" || true)
+            fi
+            if [ -n "$gate_json" ]; then
+              parsed=$(echo "$gate_json" | jq -r '.projectStatus.status // empty')
+              if [ -n "$parsed" ]; then
+                qg_status="$parsed"
+              fi
+            fi
+
+            if [ -n "$project_key" ]; then
+              new_code_param=()
+              if [ "$ISSUE_GATE_SCOPE" = "new-code" ]; then
+                new_code_param=(--data-urlencode "inNewCodePeriod=true")
+              fi
+              issues_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
+                --get "${api_base}/issues/search" \
+                --data-urlencode "componentKeys=${project_key}" \
+                --data-urlencode "pullRequest=${PR_NUMBER}" \
+                --data-urlencode "resolved=false" \
+                "${new_code_param[@]}" \
+                --data-urlencode "ps=20" || true)
+              if [ -n "$issues_json" ]; then
+                issue_total=$(echo "$issues_json" | jq -r '.total // "unknown"')
+                issue_lines=$(echo "$issues_json" | jq -r '
+                  .issues[]?
+                  | "- **\(.severity // "?")** \(.type // "?") `\((.component // "") | split(":") | last)`:\(.line // "-") — \(.message // "")"
+                ' || true)
+              fi
+            fi
+          fi
+
+          if [ -n "$host" ] && [ -n "$project_key" ]; then
+            dashboard_url="${host}/dashboard?id=$(printf '%s' "$project_key" | jq -sRr @uri)&pullRequest=${PR_NUMBER}"
+          fi
+
+          {
+            echo "<!-- casadega-sonarqube -->"
+            echo "## SonarQube"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Quality gate | \`${qg_status}\` |"
+            echo "| Issue gate (\`${ISSUE_GATE_SCOPE:-unknown}\`) | ${issue_total} unresolved |"
+            if [ -n "$dashboard_url" ]; then
+              echo "| Dashboard | [Open in SonarQube](${dashboard_url}) |"
+            fi
+            echo
+            if [ -n "$issue_lines" ]; then
+              echo "### Unresolved issues"
+              echo
+              echo "$issue_lines"
+              echo
+            elif [ "$issue_total" = "0" ]; then
+              echo "No unresolved issues in the configured issue-gate scope."
+              echo
+            fi
+            echo "_Sticky comment from \`Casadega-Development/action-workflows\`. Re-runs update this note._"
+          } > /tmp/casadega-sonar-comment.md
+
+          COMMENT_ID=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.body | contains("<!-- casadega-sonarqube -->")) | .id' \
+            2>/dev/null | head -n1 || true)
+
+          payload=$(jq -n --rawfile body /tmp/casadega-sonar-comment.md '{body: $body}')
+
+          set +e
+          if [ -n "$COMMENT_ID" ]; then
+            http_out=$(printf '%s' "$payload" | gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" --input - 2>&1)
+            status=$?
+          else
+            http_out=$(printf '%s' "$payload" | gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --input - 2>&1)
+            status=$?
+          fi
+          set -e
+
+          if [ "$status" -ne 0 ] || ! echo "$http_out" | jq -e '.id' >/dev/null 2>&1; then
+            echo "::error::Could not upsert the SonarQube PR comment. Grant pull-requests: write on the caller job that uses Casadega-Development/action-workflows sonar-scan.yml (secrets: inherit is not enough)."
+            echo "$http_out" >&2
+            exit 1
+          fi
+
+          echo "Posted sticky SonarQube comment on PR ${PR_NUMBER}."

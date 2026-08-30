@@ -1,0 +1,178 @@
+# Reusable orchestrator: resolves workflow_run / manual test-run context, then runs sonar-scan.yml.
+# Consumer repos keep a thin trigger workflow (workflow_run + optional workflow_dispatch).
+
+name: SonarQube Scan After Tests
+
+on:
+  workflow_call:
+    inputs:
+      runner-labels-json:
+        description: >-
+          JSON array (or string) for runs-on. Default keeps GitHub-hosted
+          ubuntu-latest so existing consumers are unaffected.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      test-run-id:
+        description: >-
+          Actions run ID of a completed test workflow. Required when the caller was triggered via
+          workflow_dispatch. Leave empty when the caller was triggered via workflow_run (run ID is
+          read from github.event.workflow_run.id).
+        required: false
+        type: string
+        default: ""
+      fetch-depth:
+        description: Git fetch depth passed through to the scan job.
+        required: false
+        type: number
+        default: 0
+      coverage-artifacts-json:
+        description: >-
+          JSON array of {"name":"<artifact>","path":"<dir>"} passed to sonar-scan.yml. Empty skips
+          coverage downloads.
+        required: false
+        type: string
+        default: ""
+      pre-sonar-command:
+        description: Optional shell command before Sonar scanner (repo-local coverage scope, etc.).
+        required: false
+        type: string
+        default: ""
+      issue-gate-scope:
+        description: Passed through to sonar-scan.yml (off | new-code | all-open).
+        required: false
+        type: string
+        default: all-open
+      enforce-quality-gate:
+        description: Passed through to sonar-scan.yml. When false, prints Quality Gate diagnostics without failing the workflow on the project gate.
+        required: false
+        type: boolean
+        default: true
+      enforce-zero-open-issues:
+        description: Deprecated — use issue-gate-scope. Passed through to sonar-scan.yml.
+        required: false
+        type: boolean
+        default: false
+      post-pr-comment:
+        description: Passed through to sonar-scan.yml. Sticky PR comment on pull-request scans.
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  resolve:
+    name: Resolve scan context
+    runs-on: ${{ fromJSON(inputs.runner-labels-json) }}
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      coverage-run-id: ${{ steps.context.outputs.coverage-run-id }}
+      checkout-ref: ${{ steps.context.outputs.checkout-ref }}
+      use-pull-request-scan: ${{ steps.context.outputs.use-pull-request-scan }}
+      pull-request-key: ${{ steps.context.outputs.pull-request-key }}
+      pull-request-branch: ${{ steps.context.outputs.pull-request-branch }}
+      pull-request-base: ${{ steps.context.outputs.pull-request-base }}
+      scm-revision: ${{ steps.context.outputs.scm-revision }}
+      branch-name: ${{ steps.context.outputs.branch-name }}
+    steps:
+      - name: Resolve from workflow_run or test-run-id
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TEST_RUN_ID: ${{ inputs.test-run-id }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            RUN_ID="$WORKFLOW_RUN_ID"
+            RUN_EVENT="$WORKFLOW_RUN_EVENT"
+            HEAD_SHA="$WORKFLOW_RUN_HEAD_SHA"
+            HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
+          elif [ -n "$INPUT_TEST_RUN_ID" ]; then
+            RUN_ID="$INPUT_TEST_RUN_ID"
+            RUN_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")
+            RUN_EVENT=$(echo "$RUN_JSON" | jq -r '.event')
+            HEAD_SHA=$(echo "$RUN_JSON" | jq -r '.head_sha')
+            HEAD_BRANCH=$(echo "$RUN_JSON" | jq -r '.head_branch')
+          else
+            echo "Expected workflow_run event or non-empty test-run-id input." >&2
+            exit 1
+          fi
+
+          {
+            echo "coverage-run-id=${RUN_ID}"
+            echo "checkout-ref=${HEAD_SHA}"
+            echo "scm-revision=${HEAD_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$RUN_EVENT" = "pull_request" ]; then
+            PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
+              --jq '.pull_requests[0] // empty')
+            if [ -n "$PR_JSON" ] && [ "$PR_JSON" != "null" ]; then
+              {
+                echo "use-pull-request-scan=true"
+                echo "pull-request-key=$(echo "$PR_JSON" | jq -r '.number')"
+                echo "pull-request-branch=$(echo "$PR_JSON" | jq -r '.head.ref')"
+                echo "pull-request-base=$(echo "$PR_JSON" | jq -r '.base.ref')"
+              } >> "$GITHUB_OUTPUT"
+            else
+              PR_NUMBER=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "$HEAD_BRANCH" \
+                --state open --json number --jq '.[0].number // empty')
+              if [ -z "$PR_NUMBER" ]; then
+                # PR lookup can miss (PR closed/merged between runs, fork branches).
+                # Fall back to a branch-scope scan instead of failing the whole workflow.
+                echo "::warning::Could not resolve PR number for run ${RUN_ID} (branch ${HEAD_BRANCH}); falling back to branch scan"
+                {
+                  echo "use-pull-request-scan=false"
+                  echo "branch-name=${HEAD_BRANCH}"
+                } >> "$GITHUB_OUTPUT"
+              else
+                PR_VIEW=$(gh pr view "$PR_NUMBER" --repo "${GITHUB_REPOSITORY}" --json headRefName,baseRefName)
+                {
+                  echo "use-pull-request-scan=true"
+                  echo "pull-request-key=${PR_NUMBER}"
+                  echo "pull-request-branch=$(echo "$PR_VIEW" | jq -r '.headRefName')"
+                  echo "pull-request-base=$(echo "$PR_VIEW" | jq -r '.baseRefName')"
+                } >> "$GITHUB_OUTPUT"
+              fi
+            fi
+          else
+            {
+              echo "use-pull-request-scan=false"
+              echo "branch-name=${HEAD_BRANCH}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  sonarqube:
+    name: SonarQube Scan
+    needs: resolve
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/sonar-scan.yml
+    with:
+      runner-labels-json: ${{ inputs.runner-labels-json }}
+      fetch-depth: ${{ inputs.fetch-depth }}
+      coverage-artifacts-run-id: ${{ needs.resolve.outputs.coverage-run-id }}
+      checkout-ref: ${{ needs.resolve.outputs.checkout-ref }}
+      use-pull-request-scan: ${{ needs.resolve.outputs.use-pull-request-scan == 'true' }}
+      pull-request-key: ${{ needs.resolve.outputs.pull-request-key }}
+      pull-request-branch: ${{ needs.resolve.outputs.pull-request-branch }}
+      pull-request-base: ${{ needs.resolve.outputs.pull-request-base }}
+      scm-revision: ${{ needs.resolve.outputs.scm-revision }}
+      branch-name: ${{ needs.resolve.outputs.branch-name }}
+      coverage-artifacts-json: ${{ inputs.coverage-artifacts-json }}
+      pre-sonar-command: ${{ inputs.pre-sonar-command }}
+      issue-gate-scope: ${{ inputs.issue-gate-scope }}
+      enforce-quality-gate: ${{ inputs.enforce-quality-gate }}
+      enforce-zero-open-issues: ${{ inputs.enforce-zero-open-issues }}
+      post-pr-comment: ${{ inputs.post-pr-comment }}
+    secrets: inherit
