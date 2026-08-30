@@ -2,8 +2,10 @@
 # optional issue gate, official quality-gate action, and an optional sticky PR comment.
 #
 # Callers must grant `actions: read`, `contents: read`, and (for PR comments)
-# `pull-requests: write` on the job that `uses:` this workflow. Secrets and the
-# `SONAR_HOST_URL` variable come from the caller via `secrets: inherit`.
+# `pull-requests: write` on the job that `uses:` this workflow. Pass SONAR_TOKEN
+# explicitly — `secrets: inherit` does not cross GitHub organization boundaries
+# (a personal repo calling this public org workflow will see an empty token).
+# `SONAR_HOST_URL` is a repository variable on the caller (`vars.SONAR_HOST_URL`).
 #
 # Adapted from black-flag-collective/action-workflows. Do not pin
 # sonarqube-quality-gate-action to v1.3.1 — that tag does not exist.
@@ -111,6 +113,13 @@ on:
         required: false
         type: boolean
         default: true
+    secrets:
+      SONAR_TOKEN:
+        description: >-
+          SonarQube project analysis token from the calling repository. A user
+          token is for local CLI/precheck only; CI must use a project analysis
+          token (or a user token with Execute Analysis on that project).
+        required: true
 
 jobs:
   sonarqube:
@@ -127,6 +136,16 @@ jobs:
         with:
           fetch-depth: ${{ inputs.fetch-depth }}
           ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
+
+      - name: Require SONAR_TOKEN
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "::error::SONAR_TOKEN is empty in the reusable workflow. Map it explicitly on the caller job (SONAR_TOKEN from the calling repository). secrets: inherit does not pass repository secrets from a personal repo into Casadega-Development."
+            exit 1
+          fi
 
       - name: Download coverage artifacts
         if: inputs.coverage-artifacts-json != '' && inputs.coverage-artifacts-json != '[]'

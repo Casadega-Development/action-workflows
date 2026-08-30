@@ -58,6 +58,10 @@ on:
         required: false
         type: boolean
         default: true
+    secrets:
+      SONAR_TOKEN:
+        description: Forwarded to sonar-scan.yml. Callers outside Casadega-Development must map it explicitly.
+        required: true
 
 jobs:
   resolve:
@@ -175,4 +179,5 @@ jobs:
       enforce-quality-gate: ${{ inputs.enforce-quality-gate }}
       enforce-zero-open-issues: ${{ inputs.enforce-zero-open-issues }}
       post-pr-comment: ${{ inputs.post-pr-comment }}
-    secrets: inherit
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

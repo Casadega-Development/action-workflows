@@ -23,15 +23,21 @@ Do **not** pin the quality-gate action to `v1.3.1` (that tag does not exist) or 
 
 ## Caller requirements
 
-Configure these on the **calling** repository (`secrets: inherit` runs in the caller; this repo has
-no Sonar credentials of its own):
+Configure these on the **calling** repository. This repo has no Sonar credentials of its own.
 
 | Name | Kind | Purpose |
 | --- | --- | --- |
-| `SONAR_TOKEN` | Secret | Project analysis token |
+| `SONAR_TOKEN` | Secret | **Project analysis token** (My Account → Security → Generate Tokens → type Project). A user token is for local CLI/precheck; CI must be a project analysis token (or a user token with Execute Analysis on that project). |
 | `SONAR_HOST_URL` | Variable | SonarQube server URL (for example `https://sonar.casadega.dev`) |
 
 The caller must also check in `sonar-project.properties` with `sonar.projectKey`.
+
+**Pass `SONAR_TOKEN` explicitly.** `secrets: inherit` only works inside the same GitHub organization or user. A personal repository calling this public org workflow will see an empty token (HTTP 401, and GitHub will log `SONAR_TOKEN:` with no `***` mask). Same-org Casadega callers may use inherit; everyone else must map:
+
+```yaml
+secrets:
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+```
 
 ### Permissions
 
@@ -44,8 +50,9 @@ permissions:
   pull-requests: write  # sticky PR comment (required when post-pr-comment is true)
 ```
 
-`secrets: inherit` is not enough for comments. If `pull-requests: write` is missing, the comment
-step fails closed with an error that names this requirement.
+`pull-requests: write` is required for comments; `secrets: inherit` is not enough for either
+comments or the analysis token across organization boundaries. If `pull-requests: write` is
+missing, the comment step fails closed with an error that names this requirement.
 
 Set `post-pr-comment: false` to skip the comment (branch/`main` scans skip it regardless).
 
@@ -61,7 +68,8 @@ sonarqube:
     contents: read
     pull-requests: write
   uses: Casadega-Development/action-workflows/.github/workflows/sonar-scan.yml@main
-  secrets: inherit
+  secrets:
+    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
   with:
     coverage-artifacts-json: '[{"name":"coverage-unit","path":"coverage/unit"}]'
     issue-gate-scope: new-code
@@ -85,7 +93,8 @@ jobs:
       contents: read
       pull-requests: write
     uses: Casadega-Development/action-workflows/.github/workflows/sonar-scan-after-tests.yml@main
-    secrets: inherit
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     with:
       test-run-id: ${{ github.event.inputs.test-run-id }}
       coverage-artifacts-json: '[{"name":"coverage-unit","path":"coverage/unit"}]'
