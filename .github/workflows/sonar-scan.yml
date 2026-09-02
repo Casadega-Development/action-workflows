@@ -5,7 +5,8 @@
 # `pull-requests: write` on the job that `uses:` this workflow. Pass SONAR_TOKEN
 # explicitly — `secrets: inherit` does not cross GitHub organization boundaries
 # (a personal repo calling this public org workflow will see an empty token).
-# `SONAR_HOST_URL` is a repository variable on the caller (`vars.SONAR_HOST_URL`).
+# The checked-out repository's committed `sonar.host.url` is the only server authority. An inherited
+# repository variable is compared for diagnostics and ignored when it disagrees.
 #
 # Adapted from black-flag-collective/action-workflows. Do not pin
 # sonarqube-quality-gate-action to v1.3.1 — that tag does not exist.
@@ -137,6 +138,125 @@ jobs:
           fetch-depth: ${{ inputs.fetch-depth }}
           ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
 
+      - name: Resolve committed SonarQube identity
+        id: sonar-identity
+        env:
+          # Retain the former caller variable only as a migration diagnostic. It must never select
+          # where a checked-out repository publishes source.
+          AMBIENT_SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: |
+          set -euo pipefail
+
+          # Node is already present on every supported GitHub-hosted runner and gives this preflight
+          # standards-based URL parsing. Keeping the parser here makes the reusable workflow
+          # self-contained because actions/checkout checks out the caller, not this catalog repo.
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+
+          const propertiesPath = 'sonar-project.properties';
+
+          /**
+           * Stops the identity preflight with a concise GitHub Actions annotation.
+           *
+           * @param {string} message Actionable configuration failure without credential material.
+           * @returns {never} This helper always terminates the current Node process.
+           */
+          function fail(message) {
+            console.error(`::error::${message}`);
+            process.exit(1);
+          }
+
+          /**
+           * Reads one required plain-text Sonar property without accepting a lookalike key.
+           *
+           * Both `=` and `:` separators are valid Java Properties syntax. Anchored expressions
+           * prevent names such as `sonar.host.urlsuffix` from satisfying the server identity check.
+           *
+           * @param {string} contents Complete scanner properties contents.
+           * @param {RegExp} pattern Anchored property-specific extraction expression.
+           * @param {string} key Human-readable property name used in failures.
+           * @returns {string} Non-empty committed value.
+           */
+          function readRequiredProperty(contents, pattern, key) {
+            for (const line of contents.split(/\r?\n/u)) {
+              const match = pattern.exec(line);
+              const value = match?.[1]?.trim();
+              if (value) return value;
+            }
+            fail(`${propertiesPath} must define a non-empty ${key}.`);
+          }
+
+          /**
+           * Canonicalizes a SonarQube server while preserving a meaningful context path.
+           *
+           * URL parsing normalizes scheme and hostname case plus default ports. Trailing separators
+           * are removed with a linear loop so the safety preflight cannot introduce a
+           * backtracking-regex hotspot of its own.
+           *
+           * @param {string} value Candidate committed or ambient server URL.
+           * @returns {string} Canonical HTTP(S) server URL without trailing slashes.
+           */
+          function normalizeHost(value) {
+            const parsed = new URL(value.trim());
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+              throw new Error('sonar.host.url must use HTTP or HTTPS.');
+            }
+            if (parsed.username || parsed.password) {
+              throw new Error('sonar.host.url must not contain embedded credentials.');
+            }
+            parsed.search = '';
+            parsed.hash = '';
+            let normalized = parsed.toString();
+            while (normalized.endsWith('/')) normalized = normalized.slice(0, -1);
+            return normalized;
+          }
+
+          let contents;
+          try {
+            contents = readFileSync(propertiesPath, 'utf8');
+          } catch {
+            fail(`Unable to read committed ${propertiesPath}.`);
+          }
+
+          const rawHost = readRequiredProperty(
+            contents,
+            /^\s*sonar\.host\.url\s*[=:]\s*(.*?)\s*$/u,
+            'sonar.host.url',
+          );
+          const projectKey = readRequiredProperty(
+            contents,
+            /^\s*sonar\.projectKey\s*[=:]\s*(.*?)\s*$/u,
+            'sonar.projectKey',
+          );
+          let hostUrl;
+          try {
+            hostUrl = normalizeHost(rawHost);
+          } catch {
+            fail(
+              `${propertiesPath} must define sonar.host.url as a fully-qualified HTTP(S) URL without embedded credentials.`,
+            );
+          }
+          const ambientHost = process.env.AMBIENT_SONAR_HOST_URL?.trim();
+
+          if (ambientHost) {
+            let conflicts = true;
+            try {
+              conflicts = normalizeHost(ambientHost) !== hostUrl;
+            } catch {
+              // A malformed inherited variable is still a conflict, but its value is deliberately
+              // omitted from logs in case someone accidentally embedded credentials in it.
+            }
+            if (conflicts) {
+              console.warn(
+                `::warning::Ignoring SONAR_HOST_URL because committed ${propertiesPath} pins ${hostUrl}.`,
+              );
+            }
+          }
+
+          appendFileSync(process.env.GITHUB_OUTPUT, `host_url=${hostUrl}\nproject_key=${projectKey}\n`);
+          console.log(`Using committed SonarQube host ${hostUrl} for project ${projectKey}.`);
+          NODE
+
       - name: Require SONAR_TOKEN
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -218,10 +338,11 @@ jobs:
             -Dsonar.pullrequest.branch=${{ inputs.pull-request-branch }}
             -Dsonar.pullrequest.base=${{ inputs.pull-request-base }}
             -Dsonar.scm.revision=${{ inputs.scm-revision }}
+            -Dsonar.host.url=${{ steps.sonar-identity.outputs.host_url }}
             -Dsonar.qualitygate.wait=false
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       - name: SonarQube Scan (pull request, retry)
         if: inputs.use-pull-request-scan && steps.scan-pr.outcome == 'failure'
@@ -232,10 +353,11 @@ jobs:
             -Dsonar.pullrequest.branch=${{ inputs.pull-request-branch }}
             -Dsonar.pullrequest.base=${{ inputs.pull-request-base }}
             -Dsonar.scm.revision=${{ inputs.scm-revision }}
+            -Dsonar.host.url=${{ steps.sonar-identity.outputs.host_url }}
             -Dsonar.qualitygate.wait=false
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       - name: SonarQube Scan (branch)
         id: scan-branch
@@ -245,10 +367,11 @@ jobs:
         with:
           args: >-
             -Dsonar.branch.name=${{ inputs.branch-name }}
+            -Dsonar.host.url=${{ steps.sonar-identity.outputs.host_url }}
             -Dsonar.qualitygate.wait=false
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       - name: SonarQube Scan (branch, retry)
         if: ${{ !inputs.use-pull-request-scan && steps.scan-branch.outcome == 'failure' }}
@@ -256,10 +379,11 @@ jobs:
         with:
           args: >-
             -Dsonar.branch.name=${{ inputs.branch-name }}
+            -Dsonar.host.url=${{ steps.sonar-identity.outputs.host_url }}
             -Dsonar.qualitygate.wait=false
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       - name: Resolve Sonar issue gate scope
         id: issue-gate-scope
@@ -284,7 +408,7 @@ jobs:
         id: sonar-ce-wait
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
         run: |
           set -euo pipefail
 
@@ -297,6 +421,14 @@ jobs:
           if [ -z "$ce_task_id" ]; then
             echo "No SonarQube ceTaskId found; skipping CE wait."
             exit 0
+          fi
+
+          # report-task.txt is produced by the scanner and therefore provides an independent
+          # canary that the completed upload used the same authority selected before analysis.
+          reported_server_url=$(awk -F= '$1 == "serverUrl" {print $2; exit}' .scannerwork/report-task.txt)
+          if [ -n "$reported_server_url" ] && [ "${reported_server_url%/}" != "${SONAR_HOST_URL%/}" ]; then
+            echo "SonarScanner reported server ${reported_server_url}, but committed configuration requires ${SONAR_HOST_URL}." >&2
+            exit 1
           fi
 
           api_base="${SONAR_HOST_URL%/}/api"
@@ -327,19 +459,14 @@ jobs:
         if: steps.issue-gate-scope.outputs.effective != 'off'
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
+          SONAR_PROJECT_KEY: ${{ steps.sonar-identity.outputs.project_key }}
           USE_PULL_REQUEST_SCAN: ${{ inputs.use-pull-request-scan }}
           SONAR_PULL_REQUEST: ${{ inputs.pull-request-key }}
           SONAR_BRANCH_NAME: ${{ inputs.branch-name }}
           ISSUE_GATE_SCOPE: ${{ steps.issue-gate-scope.outputs.effective }}
         run: |
           set -euo pipefail
-
-          project_key=$(awk -F= '$1 == "sonar.projectKey" {print $2; exit}' sonar-project.properties)
-          if [ -z "$project_key" ]; then
-            echo "sonar.projectKey is missing from sonar-project.properties" >&2
-            exit 1
-          fi
 
           base_url="${SONAR_HOST_URL%/}/api/issues/search"
           new_code_param=()
@@ -350,7 +477,7 @@ jobs:
           if [ "$USE_PULL_REQUEST_SCAN" = "true" ]; then
             issues_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
               --get "$base_url" \
-              --data-urlencode "componentKeys=${project_key}" \
+              --data-urlencode "componentKeys=${SONAR_PROJECT_KEY}" \
               --data-urlencode "pullRequest=${SONAR_PULL_REQUEST}" \
               --data-urlencode "resolved=false" \
               "${new_code_param[@]}" \
@@ -359,7 +486,7 @@ jobs:
           else
             issues_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
               --get "$base_url" \
-              --data-urlencode "componentKeys=${project_key}" \
+              --data-urlencode "componentKeys=${SONAR_PROJECT_KEY}" \
               --data-urlencode "branch=${SONAR_BRANCH_NAME}" \
               --data-urlencode "resolved=false" \
               "${new_code_param[@]}" \
@@ -368,7 +495,7 @@ jobs:
           fi
 
           total=$(echo "$issues_json" | jq -r '.total')
-          echo "SonarQube unresolved issue count for ${project_key}/${scope}: ${total}"
+          echo "SonarQube unresolved issue count for ${SONAR_PROJECT_KEY}/${scope}: ${total}"
           if [ "$total" -ne 0 ]; then
             echo "$issues_json" | jq -r '.issues[] | "- \(.severity) \(.type) \(.component):\(.line // "-") \(.message)"'
             exit 1
@@ -378,7 +505,7 @@ jobs:
         if: steps.sonar-ce-wait.outputs.analysis_id != ''
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
           ANALYSIS_ID: ${{ steps.sonar-ce-wait.outputs.analysis_id }}
         run: |
           set -euo pipefail
@@ -396,7 +523,7 @@ jobs:
           pollingTimeoutSec: 600
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       # Official quality-gate-action does not post GitHub comments. Upsert a sticky
       # note even when earlier gate steps failed so reviewers still see status + URL.
@@ -405,7 +532,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
+          SONAR_PROJECT_KEY: ${{ steps.sonar-identity.outputs.project_key }}
           PR_NUMBER: ${{ inputs.pull-request-key }}
           ISSUE_GATE_SCOPE: ${{ steps.issue-gate-scope.outputs.effective || inputs.issue-gate-scope }}
           ANALYSIS_ID: ${{ steps.sonar-ce-wait.outputs.analysis_id }}
@@ -418,10 +546,7 @@ jobs:
             exit 1
           fi
 
-          project_key=""
-          if [ -f sonar-project.properties ]; then
-            project_key=$(awk -F= '$1 == "sonar.projectKey" {print $2; exit}' sonar-project.properties)
-          fi
+          project_key="$SONAR_PROJECT_KEY"
 
           host="${SONAR_HOST_URL%/}"
           qg_status="${QG_ACTION_STATUS:-UNKNOWN}"
