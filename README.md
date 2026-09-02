@@ -28,9 +28,11 @@ Configure these on the **calling** repository. This repo has no Sonar credential
 | Name | Kind | Purpose |
 | --- | --- | --- |
 | `SONAR_TOKEN` | Secret | **Project analysis token** (My Account → Security → Generate Tokens → type Project). A user token is for local CLI/precheck; CI must be a project analysis token (or a user token with Execute Analysis on that project). |
-| `SONAR_HOST_URL` | Variable | SonarQube server URL (for example `https://sonar.casadega.dev`) |
 
-The caller must also check in `sonar-project.properties` with `sonar.projectKey`.
+The caller must check in `sonar-project.properties` with non-empty `sonar.host.url` and
+`sonar.projectKey` values. The committed host is the workflow's only server authority. A legacy
+`SONAR_HOST_URL` repository variable is compared for migration diagnostics and ignored when it
+disagrees, so ambient GitHub configuration cannot redirect source to another SonarQube server.
 
 **Pass `SONAR_TOKEN` explicitly.** `secrets: inherit` only works inside the same GitHub organization or user. A personal repository calling this public org workflow will see an empty token (HTTP 401, and GitHub will log `SONAR_TOKEN:` with no `***` mask). Same-org Casadega callers may use inherit; everyone else must map:
 
@@ -106,4 +108,4 @@ jobs:
 On pull-request scans the inner workflow upserts a comment marked `<!-- casadega-sonarqube -->`
 (`if: always()`, so a red gate still comments). The body includes quality-gate status, unresolved
 issues for the configured `issue-gate-scope`, and a dashboard URL from `sonar.projectKey` plus
-`SONAR_HOST_URL`. Pushes to `main` do not comment.
+the committed `sonar.host.url`. Pushes to `main` do not comment.
