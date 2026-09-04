@@ -61,6 +61,9 @@ Pull-request comments come from SonarQube's configured pull-request decoration i
 shared workflow does not publish a second GitHub Actions comment and therefore does not require
 `pull-requests: write`.
 
+The scan-after-tests orchestrator additionally requires `pull-requests: read` so it can recover the
+pull-request number and branch metadata from the completed test run.
+
 ## Type-aware JavaScript and TypeScript analysis
 
 SonarJS uses the TypeScript compiler's semantic model. A scan can complete without installed
@@ -138,6 +141,7 @@ jobs:
       actions: read
       contents: read
       packages: read
+      pull-requests: read
     uses: Casadega-Development/action-workflows/.github/workflows/sonar-scan-after-tests.yml@main
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
