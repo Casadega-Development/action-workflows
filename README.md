@@ -9,10 +9,10 @@ validate, and so on) into this repo.
 
 ## Workflows
 
-| Workflow                   | Path                                           | Role                                                                                                                                          |
-| -------------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| SonarQube Scan             | `.github/workflows/sonar-scan.yml`             | Inner scan: PR vs branch params, coverage download, Compute Engine wait, issue gate, official quality-gate action, optional sticky PR comment |
-| SonarQube Scan After Tests | `.github/workflows/sonar-scan-after-tests.yml` | Orchestrator for `workflow_run` or manual `test-run-id`; calls `sonar-scan.yml`                                                               |
+| Workflow                   | Path                                           | Role                                                                                                                  |
+| -------------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| SonarQube Scan             | `.github/workflows/sonar-scan.yml`             | Inner scan: PR vs branch params, coverage download, Compute Engine wait, issue gate, and official quality-gate action |
+| SonarQube Scan After Tests | `.github/workflows/sonar-scan-after-tests.yml` | Orchestrator for `workflow_run` or manual `test-run-id`; calls `sonar-scan.yml`                                       |
 
 Action pins:
 
@@ -44,7 +44,7 @@ secrets:
 ```
 
 The calling job and reusable job expose `NODE_AUTH_TOKEN` only to the selected package-manager
-install step. The scanner, gate APIs, comments, and diagnostic steps never receive it.
+install step. The scanner, gate APIs, and diagnostic steps never receive it.
 
 ### Permissions
 
@@ -55,14 +55,11 @@ permissions:
   actions: read # download coverage artifacts
   contents: read # checkout the analyzed commit
   packages: read # allow the caller's GITHUB_TOKEN to restore permitted private packages
-  pull-requests: write # sticky PR comment (required when post-pr-comment is true)
 ```
 
-`pull-requests: write` is required for comments; `secrets: inherit` is not enough for either
-comments or the analysis token across organization boundaries. If `pull-requests: write` is
-missing, the comment step fails closed with an error that names this requirement.
-
-Set `post-pr-comment: false` to skip the comment (branch/`main` scans skip it regardless).
+Pull-request comments come from SonarQube's configured pull-request decoration integration. The
+shared workflow does not publish a second GitHub Actions comment and therefore does not require
+`pull-requests: write`.
 
 ## Type-aware JavaScript and TypeScript analysis
 
@@ -115,7 +112,6 @@ sonarqube:
     actions: read
     contents: read
     packages: read
-    pull-requests: write
   uses: Casadega-Development/action-workflows/.github/workflows/sonar-scan.yml@main
   secrets:
     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -142,7 +138,6 @@ jobs:
       actions: read
       contents: read
       packages: read
-      pull-requests: write
     uses: Casadega-Development/action-workflows/.github/workflows/sonar-scan-after-tests.yml@main
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -152,10 +147,3 @@ jobs:
       coverage-artifacts-json: '[{"name":"coverage-unit","path":"coverage/unit"}]'
       issue-gate-scope: new-code
 ```
-
-## Sticky PR comment
-
-On pull-request scans the inner workflow upserts a comment marked `<!-- casadega-sonarqube -->`
-(`if: always()`, so a red gate still comments). The body includes quality-gate status, unresolved
-issues for the configured `issue-gate-scope`, and a dashboard URL from `sonar.projectKey` plus
-the committed `sonar.host.url`. Pushes to `main` do not comment.

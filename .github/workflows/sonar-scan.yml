@@ -1,10 +1,10 @@
 # Reusable SonarQube scan: PR vs branch parameters, coverage download, CE wait,
-# optional issue gate, official quality-gate action, and an optional sticky PR comment.
+# optional issue gate, and the official quality-gate action.
 #
-# Callers must grant `actions: read`, `contents: read`, `packages: read`, and (for PR comments)
-# `pull-requests: write` on the job that `uses:` this workflow. Pass SONAR_TOKEN explicitly —
-# `secrets: inherit` does not cross GitHub organization boundaries. Node projects with private
-# dependencies must also map a caller-owned package token into NODE_AUTH_TOKEN.
+# Callers must grant `actions: read`, `contents: read`, and `packages: read` on the job that `uses:`
+# this workflow. Pass SONAR_TOKEN explicitly — `secrets: inherit` does not cross GitHub organization
+# boundaries. Node projects with private dependencies must also map a caller-owned package token
+# into NODE_AUTH_TOKEN.
 # The checked-out repository's committed `sonar.host.url` is the only server authority. An inherited
 # repository variable is compared for diagnostics and ignored when it disagrees.
 #
@@ -139,14 +139,6 @@ on:
         required: false
         type: boolean
         default: false
-      post-pr-comment:
-        description: >-
-          When true and this is a pull-request scan, upsert a sticky PR comment with quality-gate
-          status, unresolved issues for issue-gate-scope, and the Sonar dashboard URL. Callers must
-          grant pull-requests: write or this step fails closed. Skipped on branch/main scans.
-        required: false
-        type: boolean
-        default: true
     secrets:
       SONAR_TOKEN:
         description: >-
@@ -168,13 +160,10 @@ jobs:
     # loop may independently consume ten minutes. Twenty minutes leaves room for both without
     # making a genuinely stuck scan linger indefinitely.
     timeout-minutes: 20
-    # Intersection with the caller: the caller must also grant pull-requests: write
-    # or the sticky-comment step fails closed.
     permissions:
       actions: read
       contents: read
       packages: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -795,130 +784,3 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
-
-      # Official quality-gate-action does not post GitHub comments. Upsert a sticky
-      # note even when earlier gate steps failed so reviewers still see status + URL.
-      - name: Post sticky SonarQube PR comment
-        if: ${{ always() && inputs.use-pull-request-scan && inputs.post-pr-comment }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
-          SONAR_PROJECT_KEY: ${{ steps.sonar-identity.outputs.project_key }}
-          PR_NUMBER: ${{ inputs.pull-request-key }}
-          ISSUE_GATE_SCOPE: ${{ steps.issue-gate-scope.outputs.effective || inputs.issue-gate-scope }}
-          ANALYSIS_ID: ${{ steps.sonar-ce-wait.outputs.analysis_id }}
-          QG_ACTION_STATUS: ${{ steps.sonarqube-quality-gate-check.outputs.quality-gate-status }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$PR_NUMBER" ]; then
-            echo "::error::use-pull-request-scan is true but pull-request-key is empty; cannot post a PR comment."
-            exit 1
-          fi
-
-          project_key="$SONAR_PROJECT_KEY"
-
-          host="${SONAR_HOST_URL%/}"
-          qg_status="${QG_ACTION_STATUS:-UNKNOWN}"
-          issue_total="unknown"
-          issue_lines=""
-          dashboard_url=""
-
-          # Prefer the analysis-id query (exact scan) then fall back to the PR
-          # project_status endpoint so a red gate still produces a useful comment.
-          if [ -n "$host" ] && [ -n "$SONAR_TOKEN" ]; then
-            api_base="${host}/api"
-            gate_json=""
-            if [ -n "$ANALYSIS_ID" ]; then
-              gate_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
-                "${api_base}/qualitygates/project_status?analysisId=${ANALYSIS_ID}" || true)
-            fi
-            if [ -z "$gate_json" ] && [ -n "$project_key" ]; then
-              gate_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
-                --get "${api_base}/qualitygates/project_status" \
-                --data-urlencode "projectKey=${project_key}" \
-                --data-urlencode "pullRequest=${PR_NUMBER}" || true)
-            fi
-            if [ -n "$gate_json" ]; then
-              parsed=$(echo "$gate_json" | jq -r '.projectStatus.status // empty')
-              if [ -n "$parsed" ]; then
-                qg_status="$parsed"
-              fi
-            fi
-
-            if [ -n "$project_key" ]; then
-              new_code_param=()
-              if [ "$ISSUE_GATE_SCOPE" = "new-code" ]; then
-                new_code_param=(--data-urlencode "inNewCodePeriod=true")
-              fi
-              issues_json=$(curl -fsS -u "${SONAR_TOKEN}:" \
-                --get "${api_base}/issues/search" \
-                --data-urlencode "componentKeys=${project_key}" \
-                --data-urlencode "pullRequest=${PR_NUMBER}" \
-                --data-urlencode "resolved=false" \
-                "${new_code_param[@]}" \
-                --data-urlencode "ps=20" || true)
-              if [ -n "$issues_json" ]; then
-                issue_total=$(echo "$issues_json" | jq -r '.total // "unknown"')
-                issue_lines=$(echo "$issues_json" | jq -r '
-                  .issues[]?
-                  | "- **\(.severity // "?")** \(.type // "?") `\((.component // "") | split(":") | last)`:\(.line // "-") — \(.message // "")"
-                ' || true)
-              fi
-            fi
-          fi
-
-          if [ -n "$host" ] && [ -n "$project_key" ]; then
-            dashboard_url="${host}/dashboard?id=$(printf '%s' "$project_key" | jq -sRr @uri)&pullRequest=${PR_NUMBER}"
-          fi
-
-          {
-            echo "<!-- casadega-sonarqube -->"
-            echo "## SonarQube"
-            echo
-            echo "| | |"
-            echo "| --- | --- |"
-            echo "| Quality gate | \`${qg_status}\` |"
-            echo "| Issue gate (\`${ISSUE_GATE_SCOPE:-unknown}\`) | ${issue_total} unresolved |"
-            if [ -n "$dashboard_url" ]; then
-              echo "| Dashboard | [Open in SonarQube](${dashboard_url}) |"
-            fi
-            echo
-            if [ -n "$issue_lines" ]; then
-              echo "### Unresolved issues"
-              echo
-              echo "$issue_lines"
-              echo
-            elif [ "$issue_total" = "0" ]; then
-              echo "No unresolved issues in the configured issue-gate scope."
-              echo
-            fi
-            echo "_Sticky comment from \`Casadega-Development/action-workflows\`. Re-runs update this note._"
-          } > /tmp/casadega-sonar-comment.md
-
-          COMMENT_ID=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            --jq '.[] | select(.body | contains("<!-- casadega-sonarqube -->")) | .id' \
-            2>/dev/null | head -n1 || true)
-
-          payload=$(jq -n --rawfile body /tmp/casadega-sonar-comment.md '{body: $body}')
-
-          set +e
-          if [ -n "$COMMENT_ID" ]; then
-            http_out=$(printf '%s' "$payload" | gh api --method PATCH \
-              "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" --input - 2>&1)
-            status=$?
-          else
-            http_out=$(printf '%s' "$payload" | gh api --method POST \
-              "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --input - 2>&1)
-            status=$?
-          fi
-          set -e
-
-          if [ "$status" -ne 0 ] || ! echo "$http_out" | jq -e '.id' >/dev/null 2>&1; then
-            echo "::error::Could not upsert the SonarQube PR comment. Grant pull-requests: write on the caller job that uses Casadega-Development/action-workflows sonar-scan.yml (secrets: inherit is not enough)."
-            echo "$http_out" >&2
-            exit 1
-          fi
-
-          echo "Posted sticky SonarQube comment on PR ${PR_NUMBER}."

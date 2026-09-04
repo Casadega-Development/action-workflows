@@ -73,11 +73,6 @@ on:
         required: false
         type: boolean
         default: false
-      post-pr-comment:
-        description: Passed through to sonar-scan.yml. Sticky PR comment on pull-request scans.
-        required: false
-        type: boolean
-        default: true
     secrets:
       SONAR_TOKEN:
         description: Forwarded to sonar-scan.yml. Callers outside Casadega-Development must map it explicitly.
@@ -184,7 +179,6 @@ jobs:
       actions: read
       contents: read
       packages: read
-      pull-requests: write
     uses: ./.github/workflows/sonar-scan.yml
     with:
       runner-labels-json: ${{ inputs.runner-labels-json }}
@@ -206,7 +200,6 @@ jobs:
       issue-gate-scope: ${{ inputs.issue-gate-scope }}
       enforce-quality-gate: ${{ inputs.enforce-quality-gate }}
       enforce-zero-open-issues: ${{ inputs.enforce-zero-open-issues }}
-      post-pr-comment: ${{ inputs.post-pr-comment }}
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
