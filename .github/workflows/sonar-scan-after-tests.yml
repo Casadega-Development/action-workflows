@@ -33,6 +33,26 @@ on:
         required: false
         type: string
         default: ""
+      install-node-dependencies:
+        description: Passed through to sonar-scan.yml (auto | true | false).
+        required: false
+        type: string
+        default: auto
+      node-project-directory:
+        description: Passed through to sonar-scan.yml.
+        required: false
+        type: string
+        default: "."
+      node-version-file:
+        description: Passed through to sonar-scan.yml.
+        required: false
+        type: string
+        default: .nvmrc
+      pnpm-version:
+        description: Passed through to sonar-scan.yml.
+        required: false
+        type: string
+        default: ""
       pre-sonar-command:
         description: Optional shell command before Sonar scanner (repo-local coverage scope, etc.).
         required: false
@@ -62,6 +82,9 @@ on:
       SONAR_TOKEN:
         description: Forwarded to sonar-scan.yml. Callers outside Casadega-Development must map it explicitly.
         required: true
+      NODE_AUTH_TOKEN:
+        description: Optional package-registry read token forwarded only to the dependency install.
+        required: false
 
 jobs:
   resolve:
@@ -160,6 +183,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      packages: read
       pull-requests: write
     uses: ./.github/workflows/sonar-scan.yml
     with:
@@ -174,6 +198,10 @@ jobs:
       scm-revision: ${{ needs.resolve.outputs.scm-revision }}
       branch-name: ${{ needs.resolve.outputs.branch-name }}
       coverage-artifacts-json: ${{ inputs.coverage-artifacts-json }}
+      install-node-dependencies: ${{ inputs.install-node-dependencies }}
+      node-project-directory: ${{ inputs.node-project-directory }}
+      node-version-file: ${{ inputs.node-version-file }}
+      pnpm-version: ${{ inputs.pnpm-version }}
       pre-sonar-command: ${{ inputs.pre-sonar-command }}
       issue-gate-scope: ${{ inputs.issue-gate-scope }}
       enforce-quality-gate: ${{ inputs.enforce-quality-gate }}
@@ -181,3 +209,4 @@ jobs:
       post-pr-comment: ${{ inputs.post-pr-comment }}
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}

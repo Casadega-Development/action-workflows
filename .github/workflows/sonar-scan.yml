@@ -1,10 +1,10 @@
 # Reusable SonarQube scan: PR vs branch parameters, coverage download, CE wait,
 # optional issue gate, official quality-gate action, and an optional sticky PR comment.
 #
-# Callers must grant `actions: read`, `contents: read`, and (for PR comments)
-# `pull-requests: write` on the job that `uses:` this workflow. Pass SONAR_TOKEN
-# explicitly — `secrets: inherit` does not cross GitHub organization boundaries
-# (a personal repo calling this public org workflow will see an empty token).
+# Callers must grant `actions: read`, `contents: read`, `packages: read`, and (for PR comments)
+# `pull-requests: write` on the job that `uses:` this workflow. Pass SONAR_TOKEN explicitly —
+# `secrets: inherit` does not cross GitHub organization boundaries. Node projects with private
+# dependencies must also map a caller-owned package token into NODE_AUTH_TOKEN.
 # The checked-out repository's committed `sonar.host.url` is the only server authority. An inherited
 # repository variable is compared for diagnostics and ignored when it disagrees.
 #
@@ -43,6 +43,39 @@ on:
       coverage-artifacts-run-id:
         description: >-
           Workflow run ID to download coverage artifacts from. Empty uses the current workflow run.
+        required: false
+        type: string
+        default: ""
+      install-node-dependencies:
+        description: >-
+          Whether to restore a Node project's locked dependencies before analysis. auto installs
+          when node-project-directory contains package.json and exactly one recognized lockfile;
+          true requires that shape; false opts out. Installing dependencies allows SonarJS to
+          resolve external type declarations instead of degrading semantic TypeScript analysis.
+        required: false
+        type: string
+        default: auto
+      node-project-directory:
+        description: >-
+          Repository-relative directory containing package.json and its lockfile. This supports
+          repositories whose Node project is not at the checkout root without accepting an
+          arbitrary dependency-install shell command.
+        required: false
+        type: string
+        default: "."
+      node-version-file:
+        description: >-
+          File, relative to node-project-directory, used by actions/setup-node. The workflow uses
+          it when present, otherwise package.json when it declares a supported Node version, and
+          finally the current LTS release.
+        required: false
+        type: string
+        default: .nvmrc
+      pnpm-version:
+        description: >-
+          pnpm version used only when pnpm-lock.yaml is authoritative. Empty derives the version
+          from package.json's packageManager field; pnpm repositories without either value fail
+          before installation with an actionable error.
         required: false
         type: string
         default: ""
@@ -121,22 +154,260 @@ on:
           token is for local CLI/precheck only; CI must use a project analysis
           token (or a user token with Execute Analysis on that project).
         required: true
+      NODE_AUTH_TOKEN:
+        description: >-
+          Optional package-registry read token exposed only to the dependency-install step. Map a
+          caller-owned token when package.json resolves private packages; public-only projects may
+          omit it.
+        required: false
 
 jobs:
   sonarqube:
     runs-on: ${{ fromJSON(inputs.runner-labels-json) }}
-    timeout-minutes: 15
+    # Dependency restoration adds bounded work before analysis, while the Compute Engine polling
+    # loop may independently consume ten minutes. Twenty minutes leaves room for both without
+    # making a genuinely stuck scan linger indefinitely.
+    timeout-minutes: 20
     # Intersection with the caller: the caller must also grant pull-requests: write
     # or the sticky-comment step fails closed.
     permissions:
       actions: read
       contents: read
+      packages: read
       pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: ${{ inputs.fetch-depth }}
           ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
+
+      - name: Resolve Node dependency installation
+        id: node-dependencies
+        env:
+          INSTALL_MODE: ${{ inputs.install-node-dependencies }}
+          NODE_PROJECT_DIRECTORY: ${{ inputs.node-project-directory }}
+          NODE_VERSION_FILE: ${{ inputs.node-version-file }}
+          PNPM_VERSION_OVERRIDE: ${{ inputs.pnpm-version }}
+        run: |
+          set -euo pipefail
+
+          # Normalize the configured project directory before inspecting files. Restricting the
+          # value to the checked-out repository prevents a reusable-workflow caller from making
+          # the install or cache steps operate on runner-owned paths outside the source tree.
+          project_directory="${NODE_PROJECT_DIRECTORY%/}"
+          if [ -z "$project_directory" ]; then
+            project_directory="."
+          fi
+          case "$project_directory$NODE_VERSION_FILE$PNPM_VERSION_OVERRIDE" in
+            *$'\n'*|*$'\r'*)
+              echo "::error::Node dependency inputs must be single-line values."
+              exit 1
+              ;;
+          esac
+          case "$project_directory" in
+            /*|..|../*|*/../*|*/..)
+              echo "::error::node-project-directory must remain inside the checked-out repository."
+              exit 1
+              ;;
+          esac
+          case "$NODE_VERSION_FILE" in
+            /*|..|../*|*/../*|*/..)
+              echo "::error::node-version-file must remain inside node-project-directory."
+              exit 1
+              ;;
+          esac
+          if [ ! -d "$project_directory" ]; then
+            echo "::error::node-project-directory does not exist: ${project_directory}"
+            exit 1
+          fi
+          workspace_path=$(realpath "$GITHUB_WORKSPACE")
+          project_path=$(realpath "$project_directory")
+          case "$project_path" in
+            "$workspace_path"|"$workspace_path"/*) ;;
+            *)
+              echo "::error::node-project-directory resolves outside the checked-out repository."
+              exit 1
+              ;;
+          esac
+
+          package_json="${project_directory}/package.json"
+          lockfile_count=0
+          package_manager=""
+          lockfile_path=""
+
+          # A single authoritative lockfile is required for reproducible analysis. Silently
+          # preferring one package manager would let Sonar analyze a dependency graph that differs
+          # from the graph used by the repository's own quality and build jobs.
+          if [ -f "${project_directory}/package-lock.json" ]; then
+            lockfile_count=$((lockfile_count + 1))
+            package_manager="npm"
+            lockfile_path="${project_directory}/package-lock.json"
+          fi
+          if [ -f "${project_directory}/npm-shrinkwrap.json" ]; then
+            lockfile_count=$((lockfile_count + 1))
+            package_manager="npm"
+            lockfile_path="${project_directory}/npm-shrinkwrap.json"
+          fi
+          if [ -f "${project_directory}/pnpm-lock.yaml" ]; then
+            lockfile_count=$((lockfile_count + 1))
+            package_manager="pnpm"
+            lockfile_path="${project_directory}/pnpm-lock.yaml"
+          fi
+          if [ -f "${project_directory}/yarn.lock" ]; then
+            lockfile_count=$((lockfile_count + 1))
+            package_manager="yarn"
+            lockfile_path="${project_directory}/yarn.lock"
+          fi
+
+          if [ "$lockfile_count" -gt 1 ]; then
+            echo "::error::Found multiple recognized lockfiles in ${project_directory}; keep exactly one authoritative package-manager lockfile."
+            exit 1
+          fi
+
+          case "$INSTALL_MODE" in
+            auto)
+              if [ -f "$package_json" ] && [ "$lockfile_count" -eq 1 ]; then
+                should_install=true
+              else
+                should_install=false
+              fi
+              ;;
+            true)
+              if [ ! -f "$package_json" ]; then
+                echo "::error::install-node-dependencies=true requires ${package_json}."
+                exit 1
+              fi
+              if [ "$lockfile_count" -ne 1 ]; then
+                echo "::error::install-node-dependencies=true requires exactly one recognized lockfile in ${project_directory}."
+                exit 1
+              fi
+              should_install=true
+              ;;
+            false)
+              should_install=false
+              ;;
+            *)
+              echo "::error::install-node-dependencies must be auto, true, or false; received '${INSTALL_MODE}'."
+              exit 1
+              ;;
+          esac
+
+          if [ "$INSTALL_MODE" = "auto" ] && [ "$should_install" = false ]; then
+            if [ -f "$package_json" ] && [ "$lockfile_count" -eq 0 ]; then
+              echo "::warning::Found ${package_json} without a recognized lockfile. Dependencies will not be installed, so SonarJS type inference may be incomplete."
+            elif [ ! -f "$package_json" ] && [ "$lockfile_count" -eq 1 ]; then
+              echo "::warning::Found ${lockfile_path} without ${package_json}; dependencies cannot be restored."
+            else
+              echo "::notice::No locked Node project found in ${project_directory}; skipping dependency installation."
+            fi
+          fi
+
+          declared_package_manager=""
+          declared_package_manager_version=""
+          if [ -f "$package_json" ]; then
+            package_manager_declaration=$(jq -r '.packageManager // empty' "$package_json")
+            case "$package_manager_declaration" in
+              *$'\n'*|*$'\r'*)
+                echo "::error::packageManager in ${package_json} must be a single-line value."
+                exit 1
+                ;;
+            esac
+            case "$package_manager_declaration" in
+              npm@*|pnpm@*|yarn@*)
+                declared_package_manager="${package_manager_declaration%%@*}"
+                declared_package_manager_version="${package_manager_declaration#*@}"
+                declared_package_manager_version="${declared_package_manager_version%%+*}"
+                ;;
+              "") ;;
+              *)
+                echo "::error::Unsupported packageManager declaration in ${package_json}: ${package_manager_declaration}"
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [ "$should_install" = true ] && [ -n "$declared_package_manager" ] && [ "$declared_package_manager" != "$package_manager" ]; then
+            echo "::error::packageManager declares ${declared_package_manager}, but ${lockfile_path} selects ${package_manager}."
+            exit 1
+          fi
+
+          pnpm_version="$PNPM_VERSION_OVERRIDE"
+          if [ "$should_install" = true ] && [ "$package_manager" = "pnpm" ] && [ -z "$pnpm_version" ]; then
+            if [ "$declared_package_manager" != "pnpm" ] || [ -z "$declared_package_manager_version" ]; then
+              echo "::error::A pnpm project must declare packageManager as pnpm@<version> or pass pnpm-version."
+              exit 1
+            fi
+            pnpm_version="$declared_package_manager_version"
+          fi
+
+          version_file=""
+          node_version=""
+          configured_version_file="${project_directory}/${NODE_VERSION_FILE}"
+          if [ "$should_install" = true ] && [ -n "$NODE_VERSION_FILE" ] && [ -f "$configured_version_file" ]; then
+            version_file="$configured_version_file"
+          elif [ "$should_install" = true ] && jq -e \
+            '(.volta.node != null) or (.engines.node != null) or (.devEngines.runtime != null)' \
+            "$package_json" >/dev/null 2>&1; then
+            version_file="$package_json"
+            echo "::notice::Using the Node version declared by ${package_json}."
+          else
+            node_version="lts/*"
+          fi
+
+          # Every emitted value is derived from a validated path or a fixed enumeration. The
+          # workflow deliberately avoids accepting an arbitrary install command and forwarding it
+          # through GITHUB_OUTPUT, which would make newline handling and shell trust ambiguous.
+          {
+            echo "should-install=${should_install}"
+            echo "package-manager=${package_manager}"
+            echo "project-directory=${project_directory}"
+            echo "lockfile-path=${lockfile_path}"
+            echo "version-file=${version_file}"
+            echo "node-version=${node_version}"
+            echo "pnpm-version=${pnpm_version}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Node dependency install: ${should_install} (mode=${INSTALL_MODE}, manager=${package_manager:-none}, directory=${project_directory})."
+
+      # setup-node's pnpm cache invokes `pnpm store path`, so pnpm must already be on PATH. The
+      # exact version is taken from the consumer's committed packageManager declaration unless an
+      # explicit reusable-workflow input overrides it.
+      - name: Set up pnpm
+        if: steps.node-dependencies.outputs.should-install == 'true' && steps.node-dependencies.outputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@v6
+        with:
+          version: ${{ steps.node-dependencies.outputs.pnpm-version }}
+          run_install: false
+
+      - name: Set up Node.js for dependency analysis
+        if: steps.node-dependencies.outputs.should-install == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: ${{ steps.node-dependencies.outputs.version-file }}
+          node-version: ${{ steps.node-dependencies.outputs.node-version }}
+          cache: ${{ steps.node-dependencies.outputs.package-manager }}
+          cache-dependency-path: ${{ steps.node-dependencies.outputs.lockfile-path }}
+
+      - name: Install locked npm dependencies
+        if: steps.node-dependencies.outputs.should-install == 'true' && steps.node-dependencies.outputs.package-manager == 'npm'
+        working-directory: ${{ steps.node-dependencies.outputs.project-directory }}
+        run: npm ci --ignore-scripts --no-audit --no-fund
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+
+      - name: Install locked pnpm dependencies
+        if: steps.node-dependencies.outputs.should-install == 'true' && steps.node-dependencies.outputs.package-manager == 'pnpm'
+        working-directory: ${{ steps.node-dependencies.outputs.project-directory }}
+        run: pnpm install --frozen-lockfile --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+
+      - name: Install locked Yarn dependencies
+        if: steps.node-dependencies.outputs.should-install == 'true' && steps.node-dependencies.outputs.package-manager == 'yarn'
+        working-directory: ${{ steps.node-dependencies.outputs.project-directory }}
+        run: yarn install --frozen-lockfile --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
 
       - name: Resolve committed SonarQube identity
         id: sonar-identity
