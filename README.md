@@ -43,8 +43,10 @@ secrets:
   NODE_AUTH_TOKEN: ${{ secrets.CASADEGA_PACKAGES_TOKEN || github.token }}
 ```
 
-The calling job and reusable job expose `NODE_AUTH_TOKEN` only to the selected package-manager
-install step. The scanner, gate APIs, and diagnostic steps never receive it.
+The reusable job exposes `NODE_AUTH_TOKEN` only while writing a runner-local GitHub Packages auth
+placeholder and running the selected package-manager install. The scanner, gate APIs, and
+diagnostic steps never receive it. Consumers need only the scope-to-registry mapping in project
+configuration; they must not commit a token or a CI-only auth placeholder.
 
 ### Permissions
 
@@ -101,8 +103,9 @@ version comes from `packageManager` unless `pnpm-version` is supplied.
 
 Package-manager caches remain scoped to the calling repository and are keyed by its authoritative
 lockfile. A project-level `.npmrc` is read normally because installation runs inside the checked-out
-repository. Registry credentials must still be mapped through `NODE_AUTH_TOKEN`; repository config
-does not grant authentication by itself.
+repository. When `NODE_AUTH_TOKEN` is supplied, the workflow writes a runner-only
+`//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}` entry before installation; repository config
+still does not grant authentication by itself.
 
 ## Example (same-repo PR + main baseline)
 

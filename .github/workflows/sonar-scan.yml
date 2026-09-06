@@ -3,8 +3,9 @@
 #
 # Callers must grant `actions: read`, `contents: read`, and `packages: read` on the job that `uses:`
 # this workflow. Pass SONAR_TOKEN explicitly — `secrets: inherit` does not cross GitHub organization
-# boundaries. Node projects with private dependencies must also map a caller-owned package token
-# into NODE_AUTH_TOKEN.
+# boundaries. Node projects with private GitHub Packages dependencies must also map a caller-owned
+# package token into NODE_AUTH_TOKEN; the workflow creates the runner-only npm auth entry before
+# dependency restoration.
 # The checked-out repository's committed `sonar.host.url` is the only server authority. An inherited
 # repository variable is compared for diagnostics and ignored when it disagrees.
 #
@@ -148,9 +149,9 @@ on:
         required: true
       NODE_AUTH_TOKEN:
         description: >-
-          Optional package-registry read token exposed only to the dependency-install step. Map a
-          caller-owned token when package.json resolves private packages; public-only projects may
-          omit it.
+          Optional GitHub Packages read token exposed only while configuring registry auth and
+          installing dependencies. Map a caller-owned token when package.json resolves private
+          GitHub packages; public-only projects may omit it.
         required: false
 
 jobs:
@@ -376,6 +377,34 @@ jobs:
           node-version: ${{ steps.node-dependencies.outputs.node-version }}
           cache: ${{ steps.node-dependencies.outputs.package-manager }}
           cache-dependency-path: ${{ steps.node-dependencies.outputs.lockfile-path }}
+
+      - name: Configure private GitHub Packages authentication
+        if: steps.node-dependencies.outputs.should-install == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Public-only callers legitimately omit the optional secret. Avoid
+          # writing an empty credential that could override a developer-style
+          # host entry checked into a purpose-built CI fixture.
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "No private package token was supplied; continuing with public registry access."
+            exit 0
+          fi
+
+          # Write npm's environment placeholder, not the secret value. npm,
+          # pnpm, and Yarn resolve the placeholder only inside their install
+          # steps, where NODE_AUTH_TOKEN is deliberately scoped. This lets
+          # consuming repositories keep credentials out of project .npmrc
+          # files and preserves normal user-level ~/.npmrc authentication.
+          # npm must receive the placeholder literally so it expands only
+          # inside the authenticated install.
+          # shellcheck disable=SC2016
+          npm config set \
+            "//npm.pkg.github.com/:_authToken" \
+            '${NODE_AUTH_TOKEN}' \
+            --location=user
 
       - name: Install locked npm dependencies
         if: steps.node-dependencies.outputs.should-install == 'true' && steps.node-dependencies.outputs.package-manager == 'npm'
