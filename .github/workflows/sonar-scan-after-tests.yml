@@ -58,6 +58,19 @@ on:
         required: false
         type: string
         default: ""
+      java-artifacts-json:
+        description: >-
+          Opt-in JSON array of {"path":"repo-relative directory","kind":"binaries|test-binaries|libraries|test-libraries"}.
+          Each directory must contain untracked .class files (binaries) or .jar files (libraries).
+          At least one binaries directory is required. Empty disables Java artifact transfer.
+        required: false
+        type: string
+        default: ""
+      java-version:
+        description: Exact Temurin JDK version including build (for example 17.0.12+7); required with java-artifacts-json.
+        required: false
+        type: string
+        default: ""
       pre-sonar-command:
         description: Optional shell command before Sonar scanner (repo-local coverage scope, etc.).
         required: false
@@ -209,6 +222,8 @@ jobs:
       node-project-directory: ${{ inputs.node-project-directory }}
       node-version-file: ${{ inputs.node-version-file }}
       pnpm-version: ${{ inputs.pnpm-version }}
+      java-artifacts-json: ${{ inputs.java-artifacts-json }}
+      java-version: ${{ inputs.java-version }}
       pre-sonar-command: ${{ inputs.pre-sonar-command }}
       issue-gate-scope: ${{ inputs.issue-gate-scope }}
       enforce-zero-unreviewed-hotspots: ${{ inputs.enforce-zero-unreviewed-hotspots }}

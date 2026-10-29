@@ -1,0 +1,681 @@
+# The .NET scanner runs inside MSBuild, so adopting this workflow trusts same-repository
+# contributors with the project analysis token. Fork PRs never enter this credentialed build.
+name: SonarQube .NET Trusted Analysis
+
+on:
+  workflow_call:
+    inputs:
+      prerequisite-result:
+        description: Result of the separate ordinary build, tests, and coverage gate for this same commit.
+        required: true
+        type: string
+      project-directory:
+        description: Repository-relative directory containing global.json and .config/dotnet-tools.json.
+        required: false
+        type: string
+        default: .
+      project-file:
+        description: Solution or project file relative to project-directory; restored and built during analysis.
+        required: true
+        type: string
+      test-projects-json:
+        description: Nonempty JSON array of test .csproj paths relative to project-directory; each needs pinned coverlet.collector and VSTest.
+        required: true
+        type: string
+      configuration:
+        description: Named build configuration used consistently for restore, build, and tests.
+        required: false
+        type: string
+        default: Release
+      issue-gate-scope:
+        description: Extra issue gate after server processing; all-open, new-code, or off.
+        required: false
+        type: string
+        default: all-open
+      enforce-zero-unreviewed-hotspots:
+        description: Independently require zero TO_REVIEW hotspots in the analyzed PR or default branch.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        description: Project-scoped analysis token; same-repository PR and default-branch code are trusted with this credential.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sonarqube:
+    # Caller must also use !cancelled() so a failed prerequisite reaches the explicit guard.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Require trusted invocation
+        id: invocation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_REVISION: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          PR_STATE: ${{ github.event.pull_request.state }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          PREREQUISITE_RESULT: ${{ inputs.prerequisite-result }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def revision(value):
+              """Require an immutable Git commit identifier before selecting code or base identity."""
+              if not re.fullmatch('[0-9a-f]{40}', value):
+                  raise SystemExit('.NET scans require immutable event commit identifiers.')
+              return value
+
+          def branch_name(value):
+              """Validate event branch names as literal Git refs and single-line output values."""
+              if not value or subprocess.run(['git', 'check-ref-format', 'refs/heads/' + value],
+                                             capture_output=True).returncode:
+                  raise SystemExit('.NET scans require valid event branch names.')
+              return value
+
+          # Admission is derived from GitHub's event context, never a caller-controlled trust flag.
+          # A same-repository PR is an explicit contributor trust policy, not proof of human review.
+          event = os.environ['EVENT_NAME']
+          if event not in ('pull_request', 'push', 'workflow_dispatch'):
+              raise SystemExit('.NET scans only support same-repository PRs and default-branch push/manual runs.')
+          source_revision = revision(os.environ['EVENT_REVISION'])
+          selected = {'revision': source_revision, 'use-pull-request-scan': 'false',
+                      'pull-request-key': '', 'pull-request-branch': '', 'pull-request-base': '',
+                      'branch-name': '', 'base-revision': ''}
+          if event == 'pull_request':
+              repository = os.environ.get('REPOSITORY', '')
+              if not repository or os.environ.get('PR_HEAD_REPOSITORY') != repository or os.environ.get('PR_BASE_REPOSITORY') != repository:
+                  raise SystemExit('.NET PR scans require head and base in the calling repository; forks are not trusted.')
+              number = os.environ.get('PR_NUMBER', '')
+              if not re.fullmatch('[1-9][0-9]*', number) or os.environ.get('PR_STATE') != 'open' or os.environ['EVENT_REF'] != 'refs/pull/' + number + '/merge':
+                  raise SystemExit('.NET PR scans require an open pull request with matching event identity.')
+              # Sonar analyzes the PR source commit, not GitHub's synthetic merge commit. Keeping
+              # this SHA in outputs also makes checkout and recorded scanner revision agree.
+              selected.update({'revision': revision(os.environ.get('PR_HEAD_REVISION', '')),
+                               'use-pull-request-scan': 'true', 'pull-request-key': number,
+                               'pull-request-branch': branch_name(os.environ.get('PR_HEAD_BRANCH', '')),
+                               'pull-request-base': branch_name(os.environ.get('PR_BASE_BRANCH', '')),
+                               'base-revision': revision(os.environ.get('PR_BASE_REVISION', ''))})
+          else:
+              branch = branch_name(os.environ['DEFAULT_BRANCH'])
+              if os.environ['EVENT_REF'] != 'refs/heads/' + branch:
+                  raise SystemExit('.NET push/manual scans require the caller default branch.')
+              selected['branch-name'] = branch
+          if os.environ['PREREQUISITE_RESULT'] != 'success':
+              raise SystemExit('The separate ordinary quality gate must succeed for this commit.')
+          if os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted' or os.environ.get('RUNNER_OS') != 'Linux':
+              raise SystemExit('.NET scans require a disposable GitHub-hosted Linux runner.')
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.writelines(key + '=' + value + '\n' for key, value in selected.items())
+          PY
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.invocation.outputs.revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve .NET scan configuration
+        id: config
+        env:
+          PROJECT_DIRECTORY: ${{ inputs.project-directory }}
+          PROJECT_FILE: ${{ inputs.project-file }}
+          TEST_PROJECTS_JSON: ${{ inputs.test-projects-json }}
+          BUILD_CONFIGURATION: ${{ inputs.configuration }}
+          ISSUE_GATE_SCOPE: ${{ inputs.issue-gate-scope }}
+          USE_PULL_REQUEST_SCAN: ${{ steps.invocation.outputs.use-pull-request-scan }}
+          BASE_REVISION: ${{ steps.invocation.outputs.base-revision }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import subprocess
+          from urllib.parse import urlsplit
+
+          workspace = Path.cwd().resolve()
+
+          def owned_file(root, value, suffixes):
+              """Resolve literal paths without accepting traversal, options, symlinks, or missing files."""
+              if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.][A-Za-z0-9_ ./-]*', value):
+                  raise ValueError('Expected a literal project-relative path.')
+              parts = PurePosixPath(value).parts
+              if not parts or '..' in parts or any(part in ('.git', '.sonarqube') for part in parts):
+                  raise ValueError('Project paths must stay within their declared root.')
+              path = root / value
+              if path.suffix not in suffixes or not path.is_file() or not path.resolve().is_relative_to(root):
+                  raise ValueError('Required project/configuration file is missing or escapes its root.')
+              if any(item.is_symlink() for item in (path, *path.parents) if item.is_relative_to(root)):
+                  raise ValueError('Project/configuration paths cannot traverse symbolic links.')
+              return path
+
+          directory = os.environ['PROJECT_DIRECTORY']
+          if not re.fullmatch(r'\.|[A-Za-z0-9_][A-Za-z0-9_ ./-]*', directory) or '..' in PurePosixPath(directory).parts:
+              raise ValueError('project-directory must be a literal repository-relative directory.')
+          project_root = workspace / directory
+          if not project_root.is_dir() or not project_root.resolve().is_relative_to(workspace):
+              raise ValueError('Project directory is missing or escapes the checkout.')
+          if any(item.is_symlink() for item in (project_root, *project_root.parents) if item.is_relative_to(workspace)):
+              raise ValueError('Project directory cannot traverse a symbolic link.')
+          project_root = project_root.resolve()
+          for state in (project_root / '.sonarqube', workspace / '.scannerwork'):
+              if state.exists() or state.is_symlink():
+                  raise ValueError('The checkout must not contain pre-existing scanner state.')
+          sdk_file = owned_file(project_root, 'global.json', ('.json',))
+          sdk = json.loads(sdk_file.read_text())['sdk']
+          if not re.fullmatch(r'[1-9][0-9]*\.[0-9]+\.[0-9]+', sdk.get('version', '')) or sdk.get('rollForward') != 'disable':
+              raise ValueError('global.json must pin an exact stable SDK and rollForward: disable.')
+          manifest = json.loads(owned_file(project_root, '.config/dotnet-tools.json', ('.json',)).read_text())
+          scanner = manifest['tools']['dotnet-sonarscanner']
+          if not re.fullmatch(r'[1-9][0-9]*\.[0-9]+\.[0-9]+(?:\.[0-9]+)?', scanner.get('version', '')) or scanner.get('commands') != ['dotnet-sonarscanner'] or int(scanner['version'].split('.')[0]) < 10:
+              raise ValueError('The tool manifest must pin a stable dotnet-sonarscanner command/version.')
+          project = owned_file(project_root, os.environ['PROJECT_FILE'], ('.sln', '.slnx', '.csproj'))
+          tests = json.loads(os.environ['TEST_PROJECTS_JSON'])
+          if not isinstance(tests, list) or not 1 <= len(tests) <= 64 or len(set(tests)) != len(tests):
+              raise ValueError('test-projects-json must declare one or more unique test projects.')
+          test_projects = [str(owned_file(project_root, path, ('.csproj',))) for path in tests]
+          configuration = os.environ['BUILD_CONFIGURATION']
+          if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', configuration):
+              raise ValueError('Build configuration must be a plain configuration name.')
+          if os.environ['ISSUE_GATE_SCOPE'] not in ('all-open', 'new-code', 'off'):
+              raise ValueError('Invalid issue-gate-scope.')
+          def read_properties(contents):
+              """Read the same unambiguous syntax for source settings and the committed PR base."""
+              properties = {}
+              for raw in contents.splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith(('#', '!')):
+                      continue
+                  match = re.fullmatch(r'([A-Za-z0-9_.-]+)\s*[=:]\s*(.*)', line)
+                  if not match or '\\' in line:
+                      raise ValueError('.NET Sonar settings require plain unescaped property lines.')
+                  key, value = match.groups()
+                  if key in properties:
+                      raise ValueError('Duplicate Sonar properties are ambiguous.')
+                  properties[key] = value
+              return properties
+
+          settings = owned_file(workspace, 'sonar-project.properties', ('.properties',))
+          properties = read_properties(settings.read_text())
+          host = properties['sonar.host.url'].rstrip('/')
+          url = urlsplit(host)
+          if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment or any(ord(char) < 33 for char in host):
+              raise ValueError('.NET Sonar host must be a plain HTTPS URL without credentials.')
+          project_key = properties['sonar.projectKey']
+          if not re.fullmatch(r'[A-Za-z0-9_.:-]+', project_key):
+              raise ValueError('Sonar project key must be nonempty and contain no control characters.')
+          if os.environ.get('USE_PULL_REQUEST_SCAN') == 'true':
+              # The target commit owns the credential destination. Require that identity to be
+              # established before a PR can scan, instead of allowing a PR to redirect its token.
+              # This consistency check does not isolate credentials from trusted repository code.
+              base_revision = os.environ.get('BASE_REVISION', '')
+              if not re.fullmatch('[0-9a-f]{40}', base_revision):
+                  raise ValueError('PR analysis requires the immutable target commit.')
+              base = read_properties(subprocess.check_output(
+                  ['git', 'show', base_revision + ':sonar-project.properties'], text=True))
+              if base.get('sonar.host.url', '').rstrip('/') != host or base.get('sonar.projectKey') != project_key:
+                  raise ValueError('PR Sonar host and project key must match the committed target-branch identity.')
+          # The .NET scanner does not read sonar-project.properties. Pass only reviewed scope
+          # properties explicitly; executable/authentication overrides never enter its arguments.
+          allowed = ('sonar.exclusions', 'sonar.coverage.exclusions', 'sonar.cpd.exclusions', 'sonar.test.exclusions')
+          unsupported = set(properties) - set(allowed) - {'sonar.host.url', 'sonar.projectKey'}
+          if unsupported:
+              raise ValueError('Unsupported .NET scanner properties: ' + ', '.join(sorted(unsupported)))
+          extra = {key: properties[key] for key in allowed if key in properties}
+          data = {'root': str(project_root), 'project': str(project), 'tests': test_projects,
+                  'configuration': configuration, 'sdk': sdk['version'], 'scanner': scanner['version'],
+                  'host': host, 'key': project_key, 'properties': extra}
+          destination = Path(os.environ['RUNNER_TEMP']) / 'sonar-dotnet-inputs.json'
+          destination.write_text(json.dumps(data))
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.write('sdk-version=' + sdk['version'] + '\nhost-url=' + host + '\nproject-key=' + project_key + '\n')
+          PY
+
+      - name: Install the pinned .NET SDK
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
+        with:
+          dotnet-version: ${{ steps.config.outputs.sdk-version }}
+
+      - name: Restore the pinned scanner and build graph
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          runner = Path(os.environ['RUNNER_TEMP'])
+          config = json.loads((runner / 'sonar-dotnet-inputs.json').read_text())
+          project_root = Path(config['root'])
+          if subprocess.check_output(['dotnet', '--version'], cwd=project_root, text=True).strip() != config['sdk']:
+              raise SystemExit('The selected .NET SDK does not match global.json.')
+          nuget = runner / 'sonar-dotnet-nuget.config'
+          nuget.write_text('<configuration><packageSources><clear/><add key="nuget.org" value="https://api.nuget.org/v3/index.json"/></packageSources></configuration>')
+          subprocess.run(['dotnet', 'tool', 'install', 'dotnet-sonarscanner', '--version', config['scanner'],
+                          '--tool-path', str(runner / 'sonar-dotnet-tools'), '--configfile', str(nuget)], check=True, cwd=runner)
+          # Locked mode must not bootstrap missing locks. After restore, every emitted lock must
+          # already be tracked and unchanged, including files ignored by the consumer's .gitignore.
+          workspace = Path.cwd()
+          tracked = set(subprocess.check_output(['git', 'ls-files', '-z'], text=True).split('\0'))
+          targets = list(dict.fromkeys([config['project'], *config['tests']]))
+          for target in targets:
+              subprocess.run(['dotnet', 'restore', target, '--locked-mode', '-p:RestorePackagesWithLockFile=true',
+                              '-p:Configuration=' + config['configuration']], cwd=project_root, check=True)
+          locks = list(project_root.rglob('packages.lock.json'))
+          if not locks or any(path.relative_to(workspace).as_posix() not in tracked for path in locks):
+              raise SystemExit('Commit every generated packages.lock.json before scanning.')
+          subprocess.run(['git', 'diff', '--exit-code', '--', '**/packages.lock.json'], check=True)
+          (runner / 'sonar-dotnet-reports').mkdir()
+          PY
+
+      - name: Begin .NET analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SOURCE_REVISION: ${{ steps.invocation.outputs.revision }}
+          USE_PULL_REQUEST_SCAN: ${{ steps.invocation.outputs.use-pull-request-scan }}
+          SONAR_PULL_REQUEST: ${{ steps.invocation.outputs.pull-request-key }}
+          SONAR_PULL_REQUEST_BRANCH: ${{ steps.invocation.outputs.pull-request-branch }}
+          SONAR_PULL_REQUEST_BASE: ${{ steps.invocation.outputs.pull-request-base }}
+          SONAR_BRANCH_NAME: ${{ steps.invocation.outputs.branch-name }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          if not os.environ.get('SONAR_TOKEN'):
+              raise SystemExit('Map a project-scoped SONAR_TOKEN explicitly.')
+          runner = Path(os.environ['RUNNER_TEMP'])
+          config = json.loads((runner / 'sonar-dotnet-inputs.json').read_text())
+          arguments = [str(runner / 'sonar-dotnet-tools/dotnet-sonarscanner'), 'begin', '/k:' + config['key'],
+                       '/d:sonar.host.url=' + config['host'], '/d:sonar.token=' + os.environ['SONAR_TOKEN'],
+                       '/d:sonar.scm.revision=' + os.environ['SOURCE_REVISION'],
+                       '/d:sonar.scanner.scanAll=false',
+                       '/d:sonar.cs.opencover.reportsPaths=' + str(runner / 'sonar-dotnet-reports/**/*.opencover.xml'),
+                       '/d:sonar.cs.vstest.reportsPaths=' + str(runner / 'sonar-dotnet-reports/**/*.trx')]
+          # Explicit parameters prevent CI auto-detection from using the merge preview or mixing
+          # a PR analysis with a branch analysis. Every value came from the admission step.
+          if os.environ['USE_PULL_REQUEST_SCAN'] == 'true':
+              arguments.extend(['/d:sonar.pullrequest.key=' + os.environ['SONAR_PULL_REQUEST'],
+                                '/d:sonar.pullrequest.branch=' + os.environ['SONAR_PULL_REQUEST_BRANCH'],
+                                '/d:sonar.pullrequest.base=' + os.environ['SONAR_PULL_REQUEST_BASE']])
+          else:
+              arguments.append('/d:sonar.branch.name=' + os.environ['SONAR_BRANCH_NAME'])
+          arguments.extend('/d:' + key + '=' + value for key, value in config['properties'].items())
+          # Never print the argument array: the scanner's documented begin/end contract includes
+          # the token. Build-integrated analysis is restricted to trusted code for this reason.
+          result = subprocess.run(arguments, cwd=config['root'])
+          if result.returncode:
+              raise SystemExit('SonarScanner .NET begin failed.')
+          PY
+
+      - name: Build and test the analysis graph
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import xml.etree.ElementTree as ET
+
+          runner = Path(os.environ['RUNNER_TEMP'])
+          config = json.loads((runner / 'sonar-dotnet-inputs.json').read_text())
+          root = config['root']
+          for target in dict.fromkeys([config['project'], *config['tests']]):
+              subprocess.run(['dotnet', 'build', target, '--no-restore', '--no-incremental', '--disable-build-servers',
+                              '--configuration', config['configuration']], cwd=root, check=True)
+          for index, project in enumerate(config['tests']):
+              reports = runner / 'sonar-dotnet-reports' / str(index)
+              subprocess.run(['dotnet', 'test', project, '--no-build', '--no-restore', '--configuration', config['configuration'],
+                              '--results-directory', str(reports), '--logger', 'trx', '--collect', 'XPlat Code Coverage',
+                              '--', 'DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover'],
+                             cwd=root, check=True)
+              trx = list(reports.rglob('*.trx'))
+              coverage = list(reports.rglob('*.opencover.xml'))
+              if not trx or not coverage:
+                  raise SystemExit('Every test project must produce fresh TRX and OpenCover coverage.')
+              executed = 0
+              for path in trx:
+                  counters = ET.parse(path).find('.//{*}Counters')
+                  if counters is None or int(counters.get('failed', '-1')) != 0:
+                      raise SystemExit('Invalid or failing test execution report.')
+                  executed += int(counters.get('executed', '0'))
+              if executed <= 0:
+                  raise SystemExit('A test project executed no tests.')
+              for path in coverage:
+                  summary = ET.parse(path).find('./Summary')
+                  if summary is None or int(summary.get('numSequencePoints', '0')) <= 0:
+                      raise SystemExit('Coverage report contains no instrumented sequence points.')
+          PY
+
+      - name: End .NET analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          runner = Path(os.environ['RUNNER_TEMP'])
+          config = json.loads((runner / 'sonar-dotnet-inputs.json').read_text())
+          result = subprocess.run([str(runner / 'sonar-dotnet-tools/dotnet-sonarscanner'), 'end',
+                                   '/d:sonar.token=' + os.environ['SONAR_TOKEN']], cwd=config['root'])
+          if result.returncode:
+              raise SystemExit('SonarScanner .NET end failed.')
+          report = Path(config['root']) / '.sonarqube/out/.sonar/report-task.txt'
+          if not report.is_file() or not report.resolve().is_relative_to(Path(config['root'])) or any(path.is_symlink() for path in (report, *report.parents) if path.is_relative_to(Path(config['root']))):
+              raise SystemExit('The .NET scanner did not produce task metadata.')
+          # Normalize only the known scanner metadata location so the common gate scripts retain
+          # the same failure behavior as the established CLI scan. No user-selected path is read.
+          destination = Path('.scannerwork')
+          if destination.is_symlink() or destination.exists():
+              raise SystemExit('The checkout must not contain pre-existing scanner state.')
+          destination.mkdir()
+          shutil.copyfile(report, destination / 'report-task.txt')
+          PY
+
+      - name: Wait for SonarQube background task
+        id: sonar-ce-wait
+        env:
+          SONAR_PROJECT_KEY: ${{ steps.config.outputs.project-key }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ steps.config.outputs.host-url }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f .scannerwork/report-task.txt ]; then
+            echo "SonarQube report-task.txt is missing; analysis cannot be established." >&2
+            exit 1
+          fi
+
+          ce_task_id=$(awk -F= '$1 == "ceTaskId" {print $2; exit}' .scannerwork/report-task.txt)
+          if [ -z "$ce_task_id" ]; then
+            echo "SonarQube ceTaskId is missing; analysis cannot be established." >&2
+            exit 1
+          fi
+
+          # report-task.txt is produced by the scanner and therefore provides an independent
+          # canary that the completed upload used the same authority selected before analysis.
+          reported_server_url=$(awk -F= '$1 == "serverUrl" {print $2; exit}' .scannerwork/report-task.txt)
+          if [ -n "$reported_server_url" ] && [ "${reported_server_url%/}" != "${SONAR_HOST_URL%/}" ]; then
+            echo "SonarScanner reported server ${reported_server_url}, but committed configuration requires ${SONAR_HOST_URL}." >&2
+            exit 1
+          fi
+
+          api_base="${SONAR_HOST_URL%/}/api"
+          analysis_id=""
+          for _ in $(seq 1 120); do
+            task_json=$(curl -fsS --connect-timeout 5 --max-time 15 -u "${SONAR_TOKEN}:" "${api_base}/ce/task?id=${ce_task_id}")
+            task_status=$(echo "$task_json" | jq -r '.task.status')
+            if [ "$task_status" = "SUCCESS" ]; then
+              analysis_id=$(echo "$task_json" | jq -r '.task.analysisId')
+              break
+            fi
+            if [ "$task_status" = "FAILED" ] || [ "$task_status" = "CANCELED" ]; then
+              echo "SonarQube background task ended with status ${task_status}."
+              echo "$task_json" | jq -r '.task.errorMessage // empty'
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if [ -z "$analysis_id" ] || [ "$analysis_id" = "null" ]; then
+            echo "SonarQube background task did not finish before timeout." >&2
+            exit 1
+          fi
+
+          echo "analysis_id=${analysis_id}" >> "$GITHUB_OUTPUT"
+
+      - name: SonarQube Issue Gate
+        if: inputs.issue-gate-scope != 'off'
+        env:
+          SONAR_PROJECT_KEY: ${{ steps.config.outputs.project-key }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ steps.config.outputs.host-url }}
+          USE_PULL_REQUEST_SCAN: ${{ steps.invocation.outputs.use-pull-request-scan }}
+          SONAR_PULL_REQUEST: ${{ steps.invocation.outputs.pull-request-key }}
+          SONAR_BRANCH_NAME: ${{ steps.invocation.outputs.branch-name }}
+          ISSUE_GATE_SCOPE: ${{ inputs.issue-gate-scope }}
+        run: |
+          set -euo pipefail
+
+          project_key="$SONAR_PROJECT_KEY"
+          if [ -z "$project_key" ]; then
+            echo "sonar.projectKey is missing from sonar-project.properties" >&2
+            exit 1
+          fi
+
+          base_url="${SONAR_HOST_URL%/}/api/issues/search"
+          issue_params=(--data-urlencode "ps=100")
+          if [ "$ISSUE_GATE_SCOPE" = "new-code" ]; then
+            issue_params+=(--data-urlencode "inNewCodePeriod=true")
+          fi
+
+          fetch_issues() {
+            if [ "$USE_PULL_REQUEST_SCAN" = "true" ]; then
+              issues_json=$(curl -fsS --connect-timeout 5 --max-time 15 -u "${SONAR_TOKEN}:" \
+                --get "$base_url" \
+                --data-urlencode "componentKeys=${project_key}" \
+                --data-urlencode "pullRequest=${SONAR_PULL_REQUEST}" \
+                --data-urlencode "resolved=false" \
+                "${issue_params[@]}")
+              scope="PR ${SONAR_PULL_REQUEST} (${ISSUE_GATE_SCOPE})"
+            else
+              issues_json=$(curl -fsS --connect-timeout 5 --max-time 15 -u "${SONAR_TOKEN}:" \
+                --get "$base_url" \
+                --data-urlencode "componentKeys=${project_key}" \
+                --data-urlencode "branch=${SONAR_BRANCH_NAME}" \
+                --data-urlencode "resolved=false" \
+                "${issue_params[@]}")
+              scope="${SONAR_BRANCH_NAME} (${ISSUE_GATE_SCOPE})"
+            fi
+          }
+
+          # The issue index can lag the finished analysis, so a count must hold
+          # before it counts. Two empty reads pass. Three identical non-empty
+          # reads fail at once instead of waiting out all twelve.
+          zero_reads=0
+          same_reads=0
+          previous=""
+          for attempt in $(seq 1 12); do
+            fetch_issues
+            if ! total=$(printf '%s' "$issues_json" | jq -er 'if (.total | type) == "number" and .total >= 0 and (.total | floor) == .total and (.issues | type) == "array" and (.issues | length) <= .total and (.total == 0 or (.issues | length) > 0) then .total else error("Invalid issue count") end'); then
+              echo "SonarQube did not return a valid issue count." >&2
+              exit 1
+            fi
+            echo "SonarQube unresolved issues for ${project_key}/${scope}, read ${attempt}/12: ${total}"
+            if [ "$total" -eq 0 ]; then
+              zero_reads=$((zero_reads + 1))
+              same_reads=0
+              previous=""
+              if [ "$zero_reads" -eq 2 ]; then
+                echo "SonarQube issue gate passed after two empty reads."
+                exit 0
+              fi
+            else
+              zero_reads=0
+              current="${total}:$(printf '%s' "$issues_json" | jq -c '[.issues[] | .key // [.component, .line, .message]] | sort')"
+              if [ "$current" = "$previous" ]; then
+                same_reads=$((same_reads + 1))
+              else
+                same_reads=1
+                previous="$current"
+              fi
+              if [ "$same_reads" -eq 3 ]; then
+                echo "SonarQube issue gate found the same ${total} unresolved issue(s) on three reads." >&2
+                break
+              fi
+            fi
+            if [ "$attempt" -lt 12 ]; then sleep 5; fi
+          done
+          if [ "$same_reads" -lt 3 ]; then
+            echo "SonarQube issue gate did not reach two empty reads before its retry limit." >&2
+          fi
+          findings=$(printf '%s' "$issues_json" | jq -r '.issues[] | "- \(.severity) \(.type) \(.component):\(.line // "-") \(.message)"')
+          printf '%s\n' "$findings"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### SonarQube issue gate: ${total} unresolved issue(s) in ${scope}"
+              echo
+              printf '%s\n' "$findings"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 1
+
+      - name: SonarQube Hotspot Gate
+        # Preserve strict consumer policies independently of ordinary issues and server gate thresholds.
+        # The API-only step can still report hotspots after an issue-gate failure; it executes no repo code.
+        if: ${{ !cancelled() && steps.sonar-ce-wait.outputs.analysis_id != '' && inputs.enforce-zero-unreviewed-hotspots }}
+        env:
+          SONAR_PROJECT_KEY: ${{ steps.config.outputs.project-key }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ steps.config.outputs.host-url }}
+          USE_PULL_REQUEST_SCAN: ${{ steps.invocation.outputs.use-pull-request-scan }}
+          SONAR_PULL_REQUEST: ${{ steps.invocation.outputs.pull-request-key }}
+          SONAR_BRANCH_NAME: ${{ steps.invocation.outputs.branch-name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SONAR_PROJECT_KEY" ]; then
+            echo "sonar.projectKey is required for the hotspot gate." >&2
+            exit 1
+          fi
+          target=(--data-urlencode "branch=${SONAR_BRANCH_NAME}")
+          scope="branch ${SONAR_BRANCH_NAME}"
+          if [ "$USE_PULL_REQUEST_SCAN" = true ]; then
+            target=(--data-urlencode "pullRequest=${SONAR_PULL_REQUEST}")
+            scope="PR ${SONAR_PULL_REQUEST}"
+          fi
+
+          # Indexing can lag CE completion. Require two empty reads; stable findings fail early.
+          zero_reads=0
+          same_reads=0
+          previous=""
+          for attempt in $(seq 1 12); do
+            hotspots_json=$(curl -fsS --connect-timeout 5 --max-time 15 -u "${SONAR_TOKEN}:" \
+              --get "${SONAR_HOST_URL%/}/api/hotspots/search" \
+              --data-urlencode "projectKey=${SONAR_PROJECT_KEY}" \
+              --data-urlencode "status=TO_REVIEW" --data-urlencode "ps=100" "${target[@]}")
+            # JSON booleans/strings, negative/fractional counts, missing lists and inconsistent
+            # first-page results are unavailable evidence, never proof of a clean analysis.
+            if ! total=$(printf '%s' "$hotspots_json" | jq -er 'if (.paging.total | type) == "number" and .paging.total >= 0 and (.paging.total | floor) == .paging.total and (.hotspots | type) == "array" and (.hotspots | length) <= .paging.total and (.paging.total == 0 or (.hotspots | length) > 0) then .paging.total else error("Invalid hotspot response") end'); then
+              echo "SonarQube returned an invalid hotspot response." >&2
+              exit 1
+            fi
+            echo "SonarQube unreviewed hotspots for ${SONAR_PROJECT_KEY}/${scope}, read ${attempt}/12: ${total}"
+            if [ "$total" -eq 0 ]; then
+              zero_reads=$((zero_reads + 1))
+              same_reads=0
+              previous=""
+              if [ "$zero_reads" -eq 2 ]; then
+                echo "SonarQube hotspot gate passed after two empty reads."
+                exit 0
+              fi
+            else
+              zero_reads=0
+              current="${total}:$(printf '%s' "$hotspots_json" | jq -c '[.hotspots[] | .key // [.component, .line, .message]] | sort')"
+              if [ "$current" = "$previous" ]; then
+                same_reads=$((same_reads + 1))
+              else
+                same_reads=1
+                previous="$current"
+              fi
+              if [ "$same_reads" -eq 3 ]; then break; fi
+            fi
+            if [ "$attempt" -lt 12 ]; then sleep 5; fi
+          done
+          echo "SonarQube did not establish zero unreviewed hotspots within its retry budget." >&2
+          findings=$(printf '%s' "$hotspots_json" | jq -r '.hotspots[] | "- \(.vulnerabilityProbability // "-") \(.component):\(.line // "-") \(.message)"')
+          printf '%s\n' "$findings"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### SonarQube hotspot gate: ${total} unreviewed hotspot(s) in ${scope} (first 100 shown)"
+              echo
+              printf '%s\n' "$findings"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 1
+
+      - name: SonarQube Quality Gate Diagnostics
+        # Read-only, so it also runs when the issue gate already failed.
+        if: ${{ !cancelled() && steps.sonar-ce-wait.outputs.analysis_id != '' }}
+        env:
+          SONAR_PROJECT_KEY: ${{ steps.config.outputs.project-key }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ steps.config.outputs.host-url }}
+          ANALYSIS_ID: ${{ steps.sonar-ce-wait.outputs.analysis_id }}
+          USE_PULL_REQUEST_SCAN: ${{ steps.invocation.outputs.use-pull-request-scan }}
+          SONAR_PULL_REQUEST: ${{ steps.invocation.outputs.pull-request-key }}
+          SONAR_BRANCH_NAME: ${{ steps.invocation.outputs.branch-name }}
+        run: |
+          set -euo pipefail
+
+          api_base="${SONAR_HOST_URL%/}/api"
+          gate_json=$(curl -fsS --connect-timeout 5 --max-time 15 -u "${SONAR_TOKEN}:" "${api_base}/qualitygates/project_status?analysisId=${ANALYSIS_ID}")
+          echo "$gate_json" | jq -r '.projectStatus | "SonarQube quality gate status: \(.status)"'
+          echo "$gate_json" | jq -r '.projectStatus.conditions[]? | "- \(.metricKey): \(.status) actual=\(.actualValue // "-") threshold=\(.comparator // "") \(.errorThreshold // "-")"'
+
+          # An unreviewed hotspot fails the gate without naming the code. List
+          # each one so the fix, or the review in SonarQube, can start here.
+          if echo "$gate_json" | jq -e '[.projectStatus.conditions[]? | select(.status == "ERROR" and (.metricKey | test("hotspot")))] | length > 0' >/dev/null; then
+            project_key="$SONAR_PROJECT_KEY"
+            if [ "$USE_PULL_REQUEST_SCAN" = "true" ]; then
+              target=(--data-urlencode "pullRequest=${SONAR_PULL_REQUEST}")
+            else
+              target=(--data-urlencode "branch=${SONAR_BRANCH_NAME}")
+            fi
+            if hotspots_json=$(curl -fsS --connect-timeout 5 --max-time 15 -u "${SONAR_TOKEN}:" --get "${api_base}/hotspots/search" \
+              --data-urlencode "projectKey=${project_key}" --data-urlencode "status=TO_REVIEW" --data-urlencode "ps=100" "${target[@]}"); then
+              hotspots=$(printf '%s' "$hotspots_json" | jq -r '.hotspots[]? | "- \(.vulnerabilityProbability // "-") \(.component):\(.line // "-") \(.message)"')
+              echo "Security hotspots to review:"
+              printf '%s\n' "$hotspots"
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                {
+                  echo "### SonarQube security hotspots to review"
+                  echo
+                  echo "Change the code, or mark each one reviewed in SonarQube, then re-run this check."
+                  echo
+                  printf '%s\n' "$hotspots"
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              echo "Could not list the security hotspots." >&2
+            fi
+          fi
+
+      - name: SonarQube Quality Gate check
+        if: ${{ !cancelled() && steps.sonar-ce-wait.outputs.analysis_id != '' }}
+        id: sonarqube-quality-gate-check
+        uses: sonarsource/sonarqube-quality-gate-action@7a5fffe8e523c40e0c740b6bc2712ab503e52efa # v1.2.1
+        with:
+          pollingTimeoutSec: 600
+        env:
+          SONAR_PROJECT_KEY: ${{ steps.config.outputs.project-key }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ steps.config.outputs.host-url }}
