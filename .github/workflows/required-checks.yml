@@ -1,0 +1,73 @@
+# A reusable terminal gate with an explicit inventory; omitted dependencies cannot look successful.
+name: Required checks
+
+on:
+  workflow_call:
+    inputs:
+      job-results-json:
+        description: JSON object from toJSON(needs), including each prerequisite job result.
+        required: true
+        type: string
+      required-jobs-json:
+        description: Nonempty JSON array of required job IDs; every ID must occur in job-results-json.
+        required: true
+        type: string
+      allowed-skips-json:
+        description: Explicit subset of required job IDs permitted to be skipped for this invocation.
+        required: false
+        type: string
+        default: '[]'
+
+permissions: {}
+
+jobs:
+  gate:
+    # The calling reusable-workflow job must also use always(); this job cannot revive a skipped caller.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require complete successful evidence
+        env:
+          JOB_RESULTS_JSON: ${{ inputs.job-results-json }}
+          REQUIRED_JOBS_JSON: ${{ inputs.required-jobs-json }}
+          ALLOWED_SKIPS_JSON: ${{ inputs.allowed-skips-json }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          import re
+
+          def names(variable, nonempty):
+              """Reject malformed/duplicate names so a typo cannot silently narrow required evidence."""
+              values = json.loads(os.environ[variable])
+              if not isinstance(values, list) or len(values) > 128 or (nonempty and not values):
+                  raise ValueError(variable + ' must be a bounded array of job IDs.')
+              if any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', value) for value in values):
+                  raise ValueError(variable + ' contains an invalid job ID.')
+              if len(set(values)) != len(values):
+                  raise ValueError(variable + ' contains duplicate job IDs.')
+              return set(values)
+
+          required = names('REQUIRED_JOBS_JSON', True)
+          allowed = names('ALLOWED_SKIPS_JSON', False)
+          if not allowed <= required:
+              raise ValueError('Allowed skips must be an explicit subset of required jobs.')
+          results = json.loads(os.environ['JOB_RESULTS_JSON'])
+          if not isinstance(results, dict):
+              raise ValueError('job-results-json must be the needs object.')
+          failures = []
+          for name in sorted(required):
+              evidence = results.get(name)
+              result = evidence.get('result') if isinstance(evidence, dict) else None
+              if result == 'success':
+                  continue
+              if result == 'skipped' and name in allowed:
+                  print(name + ': explicitly permitted skip')
+                  continue
+              failures.append(name + ': ' + (result if isinstance(result, str) else 'missing/invalid result'))
+          if failures:
+              raise SystemExit('Required checks did not pass: ' + '; '.join(failures))
+          print('Every declared required check succeeded or has an explicit permitted skip.')
+          PY

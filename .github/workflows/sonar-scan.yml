@@ -90,6 +90,19 @@ on:
         required: false
         type: string
         default: ""
+      java-artifacts-json:
+        description: >-
+          Opt-in JSON array of {"path":"repo-relative directory","kind":"binaries|test-binaries|libraries|test-libraries"}.
+          Each directory must contain untracked .class files (binaries) or .jar files (libraries).
+          At least one binaries directory is required. Empty disables Java artifact transfer.
+        required: false
+        type: string
+        default: ""
+      java-version:
+        description: Exact Temurin JDK version including build (for example 17.0.12+7); required with java-artifacts-json.
+        required: false
+        type: string
+        default: ""
       pre-sonar-command:
         description: >-
           Optional shell command after checkout and coverage download, before Sonar scanner
@@ -659,6 +672,13 @@ jobs:
             echo "::warning::No coverage artifacts downloaded (${failed} failed); continuing without coverage."
           fi
 
+      - name: Set up the explicitly selected Java runtime
+        if: inputs.java-artifacts-json != ''
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
       - name: Pre-Sonar command
         if: inputs.pre-sonar-command != ''
         run: ${{ inputs.pre-sonar-command }}
@@ -666,6 +686,8 @@ jobs:
       - name: Package analysis data
         env:
           EXPECTED_REVISION: ${{ needs.identity.outputs.revision }}
+          JAVA_ARTIFACTS_JSON: ${{ inputs.java-artifacts-json }}
+          JAVA_VERSION: ${{ inputs.java-version }}
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -676,6 +698,35 @@ jobs:
           import tarfile
 
           workspace = Path.cwd().resolve()
+          def java_roots():
+              """Read a bounded, explicit Java data contract without accepting globs or scanner state."""
+              raw = os.environ.get('JAVA_ARTIFACTS_JSON', '')
+              if not raw:
+                  return []
+              import re
+              if not re.fullmatch(r'[1-9][0-9]*\.[0-9]+\.[0-9]+\+[0-9]+', os.environ.get('JAVA_VERSION', '')):
+                  raise ValueError('Java artifacts require an exact java-version including its build.')
+              entries = json.loads(raw)
+              if not isinstance(entries, list) or not 1 <= len(entries) <= 32:
+                  raise ValueError('Java artifact roots must be a nonempty bounded array.')
+              seen = []
+              for entry in entries:
+                  if not isinstance(entry, dict) or set(entry) != {'path', 'kind'} or entry['kind'] not in ('binaries', 'test-binaries', 'libraries', 'test-libraries'):
+                      raise ValueError('Invalid Java artifact root descriptor.')
+                  value = entry['path']
+                  if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', value):
+                      raise ValueError('Java artifact roots must be literal repository-relative directories.')
+                  parts = value.split('/')
+                  if any(part in ('', '.', '..', '.git', '.scannerwork', '.sonarqube', 'node_modules') for part in parts):
+                      raise ValueError('Unsafe Java artifact root.')
+                  if any(value == other or value.startswith(other + '/') or other.startswith(value + '/') for other in seen):
+                      raise ValueError('Java artifact roots cannot overlap.')
+                  seen.append(value)
+              if not any(entry['kind'] == 'binaries' for entry in entries):
+                  raise ValueError('Java analysis requires at least one production binaries root.')
+              return entries
+
+          declared_java_roots = java_roots()
           output = Path(os.environ['RUNNER_TEMP']) / 'sonar-handoff'
           output.mkdir()
           tracked = set(subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0'))
@@ -711,6 +762,29 @@ jobs:
                       source = Path(parent) / 'node_modules'
                       archive.add(source, arcname=source.relative_to(workspace).as_posix(), filter=regular_file_data)
                       directories.remove('node_modules')
+          if declared_java_roots:
+              with tarfile.open(output / 'java.tar.gz', 'w:gz', dereference=False) as archive:
+                  for entry in declared_java_roots:
+                      directory = workspace / entry['path']
+                      if not directory.is_dir() or not directory.resolve().is_relative_to(workspace):
+                          raise ValueError('Declared Java output directory is missing or escapes the checkout.')
+                      # Reject every link, including a link to another in-tree directory; artifacts are bytes.
+                      if any(path.is_symlink() for path in (directory, *directory.parents) if path != workspace and path.is_relative_to(workspace)):
+                          raise ValueError('Java output directory cannot traverse a symbolic link.')
+                      suffix = '.class' if entry['kind'] in ('binaries', 'test-binaries') else '.jar'
+                      count = 0
+                      for source in sorted(directory.rglob('*')):
+                          if source.is_symlink():
+                              raise ValueError('Java output may not contain symbolic links.')
+                          if not source.is_file() or source.suffix != suffix:
+                              continue
+                          local = source.relative_to(workspace).as_posix()
+                          if local in tracked:
+                              raise ValueError('Compiled Java artifacts must not replace tracked files.')
+                          archive.add(source, arcname=local, recursive=False, filter=regular_file_data)
+                          count += 1
+                      if not count:
+                          raise ValueError('Declared Java output directory has no required bytecode/library files.')
           (output / 'manifest.json').write_text(json.dumps({'revision': os.environ['EXPECTED_REVISION'], 'workspace': str(workspace)}))
           PY
 
@@ -759,6 +833,13 @@ jobs:
           ref: ${{ needs.identity.outputs.revision }}
           persist-credentials: false
 
+      - name: Set up the explicitly selected Java runtime
+        if: inputs.java-artifacts-json != ''
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
       - name: Download analysis data
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -768,6 +849,8 @@ jobs:
       - name: Unpack validated analysis data
         env:
           EXPECTED_REVISION: ${{ needs.identity.outputs.revision }}
+          JAVA_ARTIFACTS_JSON: ${{ inputs.java-artifacts-json }}
+          JAVA_VERSION: ${{ inputs.java-version }}
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -780,6 +863,35 @@ jobs:
           import tempfile
 
           workspace = Path.cwd().resolve()
+          def java_roots():
+              """Read a bounded, explicit Java data contract without accepting globs or scanner state."""
+              raw = os.environ.get('JAVA_ARTIFACTS_JSON', '')
+              if not raw:
+                  return []
+              import re
+              if not re.fullmatch(r'[1-9][0-9]*\.[0-9]+\.[0-9]+\+[0-9]+', os.environ.get('JAVA_VERSION', '')):
+                  raise ValueError('Java artifacts require an exact java-version including its build.')
+              entries = json.loads(raw)
+              if not isinstance(entries, list) or not 1 <= len(entries) <= 32:
+                  raise ValueError('Java artifact roots must be a nonempty bounded array.')
+              seen = []
+              for entry in entries:
+                  if not isinstance(entry, dict) or set(entry) != {'path', 'kind'} or entry['kind'] not in ('binaries', 'test-binaries', 'libraries', 'test-libraries'):
+                      raise ValueError('Invalid Java artifact root descriptor.')
+                  value = entry['path']
+                  if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', value):
+                      raise ValueError('Java artifact roots must be literal repository-relative directories.')
+                  parts = value.split('/')
+                  if any(part in ('', '.', '..', '.git', '.scannerwork', '.sonarqube', 'node_modules') for part in parts):
+                      raise ValueError('Unsafe Java artifact root.')
+                  if any(value == other or value.startswith(other + '/') or other.startswith(value + '/') for other in seen):
+                      raise ValueError('Java artifact roots cannot overlap.')
+                  seen.append(value)
+              if not any(entry['kind'] == 'binaries' for entry in entries):
+                  raise ValueError('Java analysis requires at least one production binaries root.')
+              return entries
+
+          declared_java_roots = java_roots()
           source = Path(os.environ['RUNNER_TEMP']) / 'sonar-handoff'
           manifest = json.loads((source / 'manifest.json').read_text())
           if manifest.get('revision') != os.environ['EXPECTED_REVISION']:
@@ -864,6 +976,42 @@ jobs:
                   if destination.suffix in ('.info', '.lcov') and isinstance(previous, str) and previous.startswith('/'):
                       content = destination.read_text()
                       destination.write_text(content.replace('SF:' + previous + '/', 'SF:' + str(workspace) + '/'))
+              if declared_java_roots:
+                  java = staging / 'java'
+                  java.mkdir()
+                  unpack(source / 'java.tar.gz', java, False)
+                  counts = {entry['path']: 0 for entry in declared_java_roots}
+                  for compiled in java.rglob('*'):
+                      if not compiled.is_file():
+                          continue
+                      local = compiled.relative_to(java).as_posix()
+                      matches = [entry for entry in declared_java_roots if local.startswith(entry['path'] + '/')]
+                      if len(matches) != 1:
+                          raise ValueError('Java data is outside the caller-declared roots.')
+                      entry = matches[0]
+                      suffix = '.class' if entry['kind'] in ('binaries', 'test-binaries') else '.jar'
+                      if compiled.suffix != suffix:
+                          raise ValueError('Java data has an unexpected file type.')
+                      destination = workspace / local
+                      if destination.exists() or destination.is_symlink() or not inside(workspace, destination.parent):
+                          raise ValueError('Java data cannot replace source or escape through checked-out links.')
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copyfile(compiled, destination, follow_symlinks=False)
+                      counts[entry['path']] += 1
+                  if not all(counts.values()):
+                      raise ValueError('A declared Java output root is missing compiled data.')
+                  # The independently supplied contract owns these properties, not the preparation artifact.
+                  java_properties = {'binaries': 'sonar.java.binaries', 'test-binaries': 'sonar.java.test.binaries',
+                                     'libraries': 'sonar.java.libraries', 'test-libraries': 'sonar.java.test.libraries'}
+                  generated = workspace / 'sonar-project.coverage.generated.properties'
+                  with generated.open('a') as settings:
+                      for kind, key in java_properties.items():
+                          paths = [entry['path'] + ('/**/*.jar' if kind.endswith('libraries') else '')
+                                   for entry in declared_java_roots if entry['kind'] == kind]
+                          if paths:
+                              settings.write('\n' + key + '=' + ','.join(paths))
+                      settings.write('\nsonar.java.source=' + os.environ['JAVA_VERSION'].split('.')[0])
+                      settings.write('\nsonar.java.jdkHome=' + os.environ['JAVA_HOME'] + '\n')
               roots = sorted([path for path in modules.rglob('node_modules') if not any(parent.name == 'node_modules' for parent in path.relative_to(modules).parents)], key=lambda path: len(path.parts))
               for directory in roots:
                   destination = workspace / directory.relative_to(modules)
