@@ -279,6 +279,29 @@ class WorkflowScripts(unittest.TestCase):
         self.assertFalse((analysis / 'src/new.ts').exists())
         self.assertFalse((analysis / 'secret.json').exists())
 
+    def test_preparation_materializes_hardlinked_files_without_following_dependency_symlinks(self):
+        """pnpm's shared inodes must transfer as regular bytes; hostile archive links stay rejected."""
+        modules = self.workspace / 'node_modules'
+        modules.mkdir()
+        original = modules / 'original.d.ts'
+        original.write_text('export interface Reviewed {}')
+        os.link(original, modules / 'same-inode.d.ts')
+        (modules / 'alias.d.ts').symlink_to('original.d.ts')
+        (self.bin / 'git').write_text('#!/bin/sh\nprintf "sonar-project.properties\\0"\n')
+        (self.bin / 'git').chmod(0o755)
+        self.assertEqual(self.execute('Package analysis data').returncode, 0)
+        with tarfile.open(self.runner / 'sonar-handoff/modules.tar.gz') as archive:
+            self.assertTrue(archive.getmember('node_modules/original.d.ts').isfile())
+            self.assertTrue(archive.getmember('node_modules/same-inode.d.ts').isfile())
+            self.assertTrue(archive.getmember('node_modules/alias.d.ts').issym())
+        analysis = self.root / 'analysis'
+        analysis.mkdir()
+        (analysis / 'sonar-project.properties').write_text(self.settings.read_text())
+        self.workspace = analysis
+        result = self.execute('Unpack validated analysis data')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((analysis / 'node_modules/same-inode.d.ts').read_text(), 'export interface Reviewed {}')
+
     def test_placed_dependency_links_cannot_escape_through_checked_out_links(self):
         """A link safe inside staging can become unsafe after placement; check the final real target."""
         outside = self.root / 'outside'

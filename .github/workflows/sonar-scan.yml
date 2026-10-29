@@ -679,7 +679,20 @@ jobs:
           output = Path(os.environ['RUNNER_TEMP']) / 'sonar-handoff'
           output.mkdir()
           tracked = set(subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0'))
-          with tarfile.open(output / 'inputs.tar.gz', 'w:gz', dereference=False) as archive:
+          def regular_file_data(member):
+              """Materialize repeated regular-file inodes; preserve symbolic links for confinement checks."""
+              # pnpm hardlinks reviewed package files. tarfile otherwise deduplicates those inodes
+              # into hardlink members, which the independent extraction boundary correctly refuses.
+              if member.islnk():
+                  source = workspace / member.name
+                  if source.is_symlink():
+                      raise ValueError('A regular dependency file changed into a symbolic link.')
+                  member.type = tarfile.REGTYPE
+                  member.linkname = ''
+                  member.size = source.stat().st_size
+              return member
+
+          with tarfile.open(output / 'inputs.tar.gz' , 'w:gz', dereference=False) as archive:
               for parent, directories, filenames in os.walk(workspace, followlinks=False):
                   directories[:] = [name for name in directories if name not in ('.git', 'node_modules', '.scannerwork')]
                   for name in filenames:
@@ -690,13 +703,13 @@ jobs:
                       generated = local == 'sonar-project.coverage.generated.properties'
                       report = source.suffix in ('.info', '.lcov', '.xml') or ('coverage' in source.parts and source.suffix == '.json')
                       if generated or (report and local not in tracked):
-                          archive.add(source, arcname=local, recursive=False)
+                          archive.add(source, arcname=local, recursive=False, filter=regular_file_data)
           with tarfile.open(output / 'modules.tar.gz', 'w:gz', dereference=False) as archive:
               for parent, directories, _ in os.walk(workspace, followlinks=False):
                   directories[:] = [name for name in directories if name != '.git']
                   if 'node_modules' in directories:
                       source = Path(parent) / 'node_modules'
-                      archive.add(source, arcname=source.relative_to(workspace).as_posix())
+                      archive.add(source, arcname=source.relative_to(workspace).as_posix(), filter=regular_file_data)
                       directories.remove('node_modules')
           (output / 'manifest.json').write_text(json.dumps({'revision': os.environ['EXPECTED_REVISION'], 'workspace': str(workspace)}))
           PY
