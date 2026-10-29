@@ -6,6 +6,11 @@ name: SonarQube Scan After Tests
 on:
   workflow_call:
     inputs:
+      sonar-node-max-space:
+        description: Forwarded SonarJS Node heap ceiling in MiB.
+        required: false
+        type: string
+        default: '4096'
       runner-labels-json:
         description: >-
           JSON array (or string) for runs-on. Default keeps GitHub-hosted
@@ -63,6 +68,11 @@ on:
         required: false
         type: string
         default: all-open
+      enforce-zero-unreviewed-hotspots:
+        description: Independently fail on any TO_REVIEW hotspot in the selected PR or branch, regardless of the server quality gate.
+        required: false
+        type: boolean
+        default: false
       enforce-quality-gate:
         description: Passed through to sonar-scan.yml. When false, prints Quality Gate diagnostics without failing the workflow on the project gate.
         required: false
@@ -175,12 +185,15 @@ jobs:
   sonarqube:
     name: SonarQube Scan
     needs: resolve
+    if: ${{ !cancelled() }}
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/sonar-scan.yml
     with:
+      prerequisite-result: ${{ needs.resolve.result }}
+      sonar-node-max-space: ${{ inputs.sonar-node-max-space }}
       runner-labels-json: ${{ inputs.runner-labels-json }}
       fetch-depth: ${{ inputs.fetch-depth }}
       coverage-artifacts-run-id: ${{ needs.resolve.outputs.coverage-run-id }}
@@ -198,6 +211,7 @@ jobs:
       pnpm-version: ${{ inputs.pnpm-version }}
       pre-sonar-command: ${{ inputs.pre-sonar-command }}
       issue-gate-scope: ${{ inputs.issue-gate-scope }}
+      enforce-zero-unreviewed-hotspots: ${{ inputs.enforce-zero-unreviewed-hotspots }}
       enforce-quality-gate: ${{ inputs.enforce-quality-gate }}
       enforce-zero-open-issues: ${{ inputs.enforce-zero-open-issues }}
     secrets:

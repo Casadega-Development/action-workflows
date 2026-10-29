@@ -1,0 +1,3 @@
+# Python's local test bytecode is generated, never an authored workflow artifact.
+__pycache__/
+*.pyc
