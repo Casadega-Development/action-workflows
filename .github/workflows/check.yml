@@ -19,5 +19,5 @@ jobs:
           persist-credentials: false
       - name: Validate workflow syntax and embedded shell
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-      - name: Exercise offline gates and isolation boundaries
+      - name: Exercise offline gates and scanner validation
         run: python3 -m unittest discover -s tests -v

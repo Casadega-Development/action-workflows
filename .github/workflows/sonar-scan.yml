@@ -1,4 +1,4 @@
-# Isolated reusable SonarQube scan: PR vs branch parameters, coverage download, CE wait,
+# Reusable SonarQube scan: PR vs branch parameters, coverage download, CE wait,
 # optional issue gate, and the official quality-gate action.
 #
 # Callers must grant `actions: read`, `contents: read`, and `packages: read` on the job that `uses:`
@@ -29,8 +29,8 @@ on:
         default: '4096'
       runner-labels-json:
         description: >-
-          JSON array (or string) for runs-on. Only GitHub-hosted Linux runners are supported so preparation
-          and credential-bearing analysis always use separate disposable machines.
+          JSON array (or string) for runs-on. Only GitHub-hosted Linux runners are supported. Preparation and analysis run
+          together on one disposable machine.
         required: false
         type: string
         default: '"ubuntu-latest"'
@@ -94,7 +94,7 @@ on:
         description: >-
           Opt-in JSON array of {"path":"repo-relative directory","kind":"binaries|test-binaries|libraries|test-libraries"}.
           Each directory must contain untracked .class files (binaries) or .jar files (libraries).
-          At least one binaries directory is required. Empty disables Java artifact transfer.
+          At least one binaries directory is required. Empty disables Java artifact setup.
         required: false
         type: string
         default: ""
@@ -171,9 +171,8 @@ on:
     secrets:
       SONAR_TOKEN:
         description: >-
-          SonarQube project analysis token from the calling repository. A user
-          token is for local CLI/precheck only; CI must use a project analysis
-          token (or a user token with Execute Analysis on that project).
+          SonarQube project analysis token or a dedicated service-account user token
+          with the project permissions required by the scanner and configured API gates.
         required: true
       NODE_AUTH_TOKEN:
         description: >-
@@ -182,19 +181,16 @@ on:
           GitHub packages; public-only projects may omit it.
         required: false
 
-# Identity resolution never executes checked-out code. Preparation has no Sonar token.
-# Analysis consumes only validated data on a different GitHub-hosted runner.
+# Resolve the authority before running project code. Installation and scanning share a runner,
+# so this workflow deliberately accepts that preparation can affect the token-bearing scan.
 jobs:
-  identity:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+  sonarqube:
+    runs-on: ${{ fromJSON(inputs.runner-labels-json) }}
+    timeout-minutes: 50
     permissions:
       contents: read
-    outputs:
-      host-url: ${{ steps.sonar-identity.outputs.host_url }}
-      project-key: ${{ steps.sonar-identity.outputs.project_key }}
-      revision: ${{ steps.source.outputs.commit }}
-      handoff-name: ${{ steps.sonar-identity.outputs.handoff_name }}
+      actions: read
+      packages: read
     steps:
       - name: Require successful prerequisite
         env:
@@ -232,7 +228,6 @@ jobs:
           # self-contained because actions/checkout checks out the caller, not this catalog repo.
           node --input-type=module <<'NODE'
           import { appendFileSync, readFileSync } from 'node:fs';
-          import { randomUUID } from 'node:crypto';
 
           const propertiesPath = '.sonar-authority/sonar-project.properties';
 
@@ -334,28 +329,17 @@ jobs:
             }
           }
 
-          // A trusted unique name prevents two consumers in one run from colliding on an artifact.
-          appendFileSync(process.env.GITHUB_OUTPUT, `host_url=${hostUrl}\nproject_key=${projectKey}\nhandoff_name=sonar-inputs-${randomUUID()}\n`);
+          // The later scanner and API gates use the same authority so preparation cannot
+          // silently redirect analysis to a different configured SonarQube project.
+          appendFileSync(process.env.GITHUB_OUTPUT, `host_url=${hostUrl}\nproject_key=${projectKey}\n`);
           console.log(`Using committed SonarQube host ${hostUrl} for project ${projectKey}.`);
           NODE
 
-      # Resolve once before preparation so mutable checkout-ref inputs cannot select two revisions.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        id: source
-        with:
-          ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
-          path: .sonar-source
-          persist-credentials: false
+      # Remove only the temporary authority checkout before checking the requested revision
+      # into the workspace; leaving it here could add unrelated files to scanner discovery.
+      - name: Remove temporary authority checkout
+        run: rm -rf .sonar-authority
 
-  prepare:
-    needs: identity
-    runs-on: ${{ fromJSON(inputs.runner-labels-json) }}
-    timeout-minutes: 25
-    permissions:
-      contents: read
-      actions: read
-      packages: read
-    steps:
       - name: Require disposable Linux runner
         run: |
           set -euo pipefail
@@ -364,10 +348,13 @@ jobs:
             exit 1
           fi
 
+      # Resolve the requested ref once before preparation, and use this same checkout for
+      # installation, coverage, analysis, and the downstream quality gates.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        id: source
         with:
           fetch-depth: ${{ inputs.fetch-depth }}
-          ref: ${{ needs.identity.outputs.revision }}
+          ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
           persist-credentials: false
 
       - name: Resolve Node dependency installation
@@ -683,19 +670,18 @@ jobs:
         if: inputs.pre-sonar-command != ''
         run: ${{ inputs.pre-sonar-command }}
 
-      - name: Package analysis data
+      - name: Validate Java analysis inputs
+        if: inputs.java-artifacts-json != ''
         env:
-          EXPECTED_REVISION: ${{ needs.identity.outputs.revision }}
           JAVA_ARTIFACTS_JSON: ${{ inputs.java-artifacts-json }}
           JAVA_VERSION: ${{ inputs.java-version }}
         run: |
           set -euo pipefail
-          python3 <<'PY'
+          python3 <<'PYJAVA'
           import json
           import os
           from pathlib import Path
           import subprocess
-          import tarfile
 
           workspace = Path.cwd().resolve()
           def java_roots():
@@ -727,310 +713,47 @@ jobs:
               return entries
 
           declared_java_roots = java_roots()
-          output = Path(os.environ['RUNNER_TEMP']) / 'sonar-handoff'
-          output.mkdir()
           tracked = set(subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0'))
-          def regular_file_data(member):
-              """Materialize repeated regular-file inodes; preserve symbolic links for confinement checks."""
-              # pnpm hardlinks reviewed package files. tarfile otherwise deduplicates those inodes
-              # into hardlink members, which the independent extraction boundary correctly refuses.
-              if member.islnk():
-                  source = workspace / member.name
+          for entry in declared_java_roots:
+              directory = workspace / entry['path']
+              if not directory.is_dir() or not directory.resolve().is_relative_to(workspace):
+                  raise ValueError('Declared Java output directory is missing or escapes the checkout.')
+              # The manifest describes only local generated output. Reject symlink traversal and
+              # tracked compiled files so the contract remains consistent across runner layouts.
+              if any(path.is_symlink() for path in (directory, *directory.parents) if path != workspace and path.is_relative_to(workspace)):
+                  raise ValueError('Java output directory cannot traverse a symbolic link.')
+              suffix = '.class' if entry['kind'] in ('binaries', 'test-binaries') else '.jar'
+              count = 0
+              for source in sorted(directory.rglob('*')):
                   if source.is_symlink():
-                      raise ValueError('A regular dependency file changed into a symbolic link.')
-                  member.type = tarfile.REGTYPE
-                  member.linkname = ''
-                  member.size = source.stat().st_size
-              return member
-
-          with tarfile.open(output / 'inputs.tar.gz' , 'w:gz', dereference=False) as archive:
-              for parent, directories, filenames in os.walk(workspace, followlinks=False):
-                  directories[:] = [name for name in directories if name not in ('.git', 'node_modules', '.scannerwork')]
-                  for name in filenames:
-                      source = Path(parent) / name
-                      local = source.relative_to(workspace).as_posix()
-                      # Only reports and the one declared generated properties file cross this boundary.
-                      # Tracked application code and arbitrary generated credential JSON are excluded.
-                      generated = local == 'sonar-project.coverage.generated.properties'
-                      report = source.suffix in ('.info', '.lcov', '.xml') or ('coverage' in source.parts and source.suffix == '.json')
-                      if generated or (report and local not in tracked):
-                          archive.add(source, arcname=local, recursive=False, filter=regular_file_data)
-          with tarfile.open(output / 'modules.tar.gz', 'w:gz', dereference=False) as archive:
-              for parent, directories, _ in os.walk(workspace, followlinks=False):
-                  directories[:] = [name for name in directories if name != '.git']
-                  if 'node_modules' in directories:
-                      source = Path(parent) / 'node_modules'
-                      archive.add(source, arcname=source.relative_to(workspace).as_posix(), filter=regular_file_data)
-                      directories.remove('node_modules')
-          if declared_java_roots:
-              with tarfile.open(output / 'java.tar.gz', 'w:gz', dereference=False) as archive:
-                  for entry in declared_java_roots:
-                      directory = workspace / entry['path']
-                      if not directory.is_dir() or not directory.resolve().is_relative_to(workspace):
-                          raise ValueError('Declared Java output directory is missing or escapes the checkout.')
-                      # Reject every link, including a link to another in-tree directory; artifacts are bytes.
-                      if any(path.is_symlink() for path in (directory, *directory.parents) if path != workspace and path.is_relative_to(workspace)):
-                          raise ValueError('Java output directory cannot traverse a symbolic link.')
-                      suffix = '.class' if entry['kind'] in ('binaries', 'test-binaries') else '.jar'
-                      count = 0
-                      for source in sorted(directory.rglob('*')):
-                          if source.is_symlink():
-                              raise ValueError('Java output may not contain symbolic links.')
-                          if not source.is_file() or source.suffix != suffix:
-                              continue
-                          local = source.relative_to(workspace).as_posix()
-                          if local in tracked:
-                              raise ValueError('Compiled Java artifacts must not replace tracked files.')
-                          archive.add(source, arcname=local, recursive=False, filter=regular_file_data)
-                          count += 1
-                      if not count:
-                          raise ValueError('Declared Java output directory has no required bytecode/library files.')
-          (output / 'manifest.json').write_text(json.dumps({'revision': os.environ['EXPECTED_REVISION'], 'workspace': str(workspace)}))
-          PY
-
-      - name: Upload analysis data
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ${{ needs.identity.outputs.handoff-name }}
-          path: ${{ runner.temp }}/sonar-handoff/
-          if-no-files-found: error
-          retention-days: 1
-
-  sonarqube:
-    needs: [identity, prepare]
-    # A preparation or identity failure must produce a failed scan, never a skipped required check.
-    if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(inputs.runner-labels-json) }}
-    timeout-minutes: 25
-    permissions:
-      contents: read
-      actions: read
-    env:
-      SONAR_PROJECT_KEY: ${{ needs.identity.outputs.project-key }}
-    steps:
-      - name: Require disposable Linux runner
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_ENVIRONMENT" != github-hosted ] || [ "$RUNNER_OS" != Linux ]; then
-            echo "::error::Sonar jobs require disposable GitHub-hosted Linux runners."
-            exit 1
-          fi
-
-      - name: Require prepared analysis
-        env:
-          IDENTITY_RESULT: ${{ needs.identity.result }}
-          PREPARE_RESULT: ${{ needs.prepare.result }}
-        run: |
-          set -euo pipefail
-          if [ "$IDENTITY_RESULT" != success ] || [ "$PREPARE_RESULT" != success ]; then
-            echo "::error::Sonar identity or preparation failed; no scanner or credentialed API call will run."
-            exit 1
-          fi
-
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: ${{ inputs.fetch-depth }}
-          ref: ${{ needs.identity.outputs.revision }}
-          persist-credentials: false
-
-      - name: Set up the explicitly selected Java runtime
-        if: inputs.java-artifacts-json != ''
-        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
-        with:
-          distribution: temurin
-          java-version: ${{ inputs.java-version }}
-
-      - name: Download analysis data
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: ${{ needs.identity.outputs.handoff-name }}
-          path: ${{ runner.temp }}/sonar-handoff/
-
-      - name: Unpack validated analysis data
-        env:
-          EXPECTED_REVISION: ${{ needs.identity.outputs.revision }}
-          JAVA_ARTIFACTS_JSON: ${{ inputs.java-artifacts-json }}
-          JAVA_VERSION: ${{ inputs.java-version }}
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          import json
-          import os
-          from pathlib import Path, PurePosixPath
-          import posixpath
-          import shutil
-          import tarfile
-          import tempfile
-
-          workspace = Path.cwd().resolve()
-          def java_roots():
-              """Read a bounded, explicit Java data contract without accepting globs or scanner state."""
-              raw = os.environ.get('JAVA_ARTIFACTS_JSON', '')
-              if not raw:
-                  return []
-              import re
-              if not re.fullmatch(r'[1-9][0-9]*\.[0-9]+\.[0-9]+\+[0-9]+', os.environ.get('JAVA_VERSION', '')):
-                  raise ValueError('Java artifacts require an exact java-version including its build.')
-              entries = json.loads(raw)
-              if not isinstance(entries, list) or not 1 <= len(entries) <= 32:
-                  raise ValueError('Java artifact roots must be a nonempty bounded array.')
-              seen = []
-              for entry in entries:
-                  if not isinstance(entry, dict) or set(entry) != {'path', 'kind'} or entry['kind'] not in ('binaries', 'test-binaries', 'libraries', 'test-libraries'):
-                      raise ValueError('Invalid Java artifact root descriptor.')
-                  value = entry['path']
-                  if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', value):
-                      raise ValueError('Java artifact roots must be literal repository-relative directories.')
-                  parts = value.split('/')
-                  if any(part in ('', '.', '..', '.git', '.scannerwork', '.sonarqube', 'node_modules') for part in parts):
-                      raise ValueError('Unsafe Java artifact root.')
-                  if any(value == other or value.startswith(other + '/') or other.startswith(value + '/') for other in seen):
-                      raise ValueError('Java artifact roots cannot overlap.')
-                  seen.append(value)
-              if not any(entry['kind'] == 'binaries' for entry in entries):
-                  raise ValueError('Java analysis requires at least one production binaries root.')
-              return entries
-
-          declared_java_roots = java_roots()
-          source = Path(os.environ['RUNNER_TEMP']) / 'sonar-handoff'
-          manifest = json.loads((source / 'manifest.json').read_text())
-          if manifest.get('revision') != os.environ['EXPECTED_REVISION']:
-              raise SystemExit('Analysis data does not match the independently resolved source revision.')
-
-          def inside(root, candidate):
-              """Check resolved ancestry so symlink chains cannot redirect writes outside the boundary."""
-              return candidate.resolve().is_relative_to(root.resolve())
-
-          def unpack(archive_path, target, modules):
-              """Write regular data first, then confined links; never extract a member through a link."""
-              links = []
-              with tarfile.open(archive_path) as archive:
-                  for member in archive:
-                      path = PurePosixPath(member.name)
-                      if path.is_absolute() or '..' in path.parts or not path.parts or chr(92) in member.name or any(ord(char) < 32 for char in member.name):
-                          raise ValueError('Unsafe archive member path.')
-                      if '.git' in path.parts or '.scannerwork' in path.parts:
-                          raise ValueError('Git/scanner state cannot be transferred.')
-                      if modules and 'node_modules' not in path.parts:
-                          # Parent directories carry no payload; all files and links must be dependencies.
-                          if member.isdir():
-                              continue
-                          raise ValueError('Dependency data is outside node_modules.')
-                      destination = target / member.name
-                      if member.isdir():
-                          destination.mkdir(parents=True, exist_ok=True)
-                      elif member.isfile():
-                          destination.parent.mkdir(parents=True, exist_ok=True)
-                          stream = archive.extractfile(member)
-                          if stream is None:
-                              raise ValueError('Archive member has no readable data.')
-                          with stream, destination.open('xb') as output:
-                              shutil.copyfileobj(stream, output)
-                      elif modules and member.issym():
-                          link = PurePosixPath(member.linkname)
-                          resolved = PurePosixPath(posixpath.normpath(str(path.parent / link)))
-                          if link.is_absolute() or '..' in resolved.parts or chr(92) in member.linkname:
-                              raise ValueError('Dependency link leaves its data boundary.')
-                          links.append((destination, member.linkname))
-                      else:
-                          raise ValueError('Only regular report data and confined dependency links are accepted.')
-              for destination, link in links:
-                  destination.parent.mkdir(parents=True, exist_ok=True)
-                  destination.symlink_to(link)
-              for destination, _ in links:
-                  if not inside(target, destination):
-                      raise ValueError('Dependency link chain leaves its data boundary.')
-
-          for name in ('sonar-project.properties', 'sonar-project.coverage.generated.properties'):
-              if (workspace / name).is_symlink():
-                  raise SystemExit('Scanner settings must be real files, not symbolic links.')
-          scanner_state = workspace / '.scannerwork'
-          if scanner_state.is_symlink() or scanner_state.is_file():
-              scanner_state.unlink()
-          elif scanner_state.exists():
-              shutil.rmtree(scanner_state)
-          with tempfile.TemporaryDirectory(prefix='sonar-unpack-', dir=os.environ['RUNNER_TEMP']) as temporary:
-              staging = Path(temporary)
-              reports, modules = staging / 'reports', staging / 'modules'
-              reports.mkdir()
-              modules.mkdir()
-              unpack(source / 'inputs.tar.gz', reports, False)
-              unpack(source / 'modules.tar.gz', modules, True)
-              for report in reports.rglob('*'):
-                  if not report.is_file():
-                      continue
-                  local = report.relative_to(reports)
-                  generated = local.as_posix() == 'sonar-project.coverage.generated.properties'
-                  allowed = report.suffix in ('.info', '.lcov', '.xml') or ('coverage' in local.parts and report.suffix == '.json')
-                  destination = workspace / local
-                  if not (generated or allowed) or not inside(workspace, destination.parent):
-                      raise ValueError('Report path is not permitted.')
-                  # exists() follows links and is false for dangling ones. Refuse the link
-                  # itself so copying a report cannot create its nonexistent external target.
-                  if destination.is_symlink() or (destination.exists() and not generated):
-                      raise ValueError('Report data cannot replace checked-out source files.')
-                  destination.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copyfile(report, destination, follow_symlinks=False)
-                  # LCOV embeds absolute paths; only its source-path records need runner relocation.
-                  previous = manifest.get('workspace')
-                  if destination.suffix in ('.info', '.lcov') and isinstance(previous, str) and previous.startswith('/'):
-                      content = destination.read_text()
-                      destination.write_text(content.replace('SF:' + previous + '/', 'SF:' + str(workspace) + '/'))
-              if declared_java_roots:
-                  java = staging / 'java'
-                  java.mkdir()
-                  unpack(source / 'java.tar.gz', java, False)
-                  counts = {entry['path']: 0 for entry in declared_java_roots}
-                  for compiled in java.rglob('*'):
-                      if not compiled.is_file():
-                          continue
-                      local = compiled.relative_to(java).as_posix()
-                      matches = [entry for entry in declared_java_roots if local.startswith(entry['path'] + '/')]
-                      if len(matches) != 1:
-                          raise ValueError('Java data is outside the caller-declared roots.')
-                      entry = matches[0]
-                      suffix = '.class' if entry['kind'] in ('binaries', 'test-binaries') else '.jar'
-                      if compiled.suffix != suffix:
-                          raise ValueError('Java data has an unexpected file type.')
-                      destination = workspace / local
-                      if destination.exists() or destination.is_symlink() or not inside(workspace, destination.parent):
-                          raise ValueError('Java data cannot replace source or escape through checked-out links.')
-                      destination.parent.mkdir(parents=True, exist_ok=True)
-                      shutil.copyfile(compiled, destination, follow_symlinks=False)
-                      counts[entry['path']] += 1
-                  if not all(counts.values()):
-                      raise ValueError('A declared Java output root is missing compiled data.')
-                  # The independently supplied contract owns these properties, not the preparation artifact.
-                  java_properties = {'binaries': 'sonar.java.binaries', 'test-binaries': 'sonar.java.test.binaries',
-                                     'libraries': 'sonar.java.libraries', 'test-libraries': 'sonar.java.test.libraries'}
-                  generated = workspace / 'sonar-project.coverage.generated.properties'
-                  with generated.open('a') as settings:
-                      for kind, key in java_properties.items():
-                          paths = [entry['path'] + ('/**/*.jar' if kind.endswith('libraries') else '')
-                                   for entry in declared_java_roots if entry['kind'] == kind]
-                          if paths:
-                              settings.write('\n' + key + '=' + ','.join(paths))
-                      settings.write('\nsonar.java.source=' + os.environ['JAVA_VERSION'].split('.')[0])
-                      settings.write('\nsonar.java.jdkHome=' + os.environ['JAVA_HOME'] + '\n')
-              roots = sorted([path for path in modules.rglob('node_modules') if not any(parent.name == 'node_modules' for parent in path.relative_to(modules).parents)], key=lambda path: len(path.parts))
-              for directory in roots:
-                  destination = workspace / directory.relative_to(modules)
-                  if not inside(workspace, destination.parent):
-                      raise ValueError('Dependency destination escapes through checked-out links.')
-                  destination.parent.mkdir(parents=True, exist_ok=True)
-                  if destination.is_symlink() or destination.is_file():
-                      destination.unlink()
-                  elif destination.exists():
-                      shutil.rmtree(destination)
-                  shutil.move(str(directory), destination)
-                  for entry in destination.rglob('*'):
-                      if entry.is_symlink() and not inside(workspace, entry):
-                          raise ValueError('Placed dependency link escapes through checked-out source.')
-          PY
+                      raise ValueError('Java output may not contain symbolic links.')
+                  if source.is_file() and source.suffix == suffix:
+                      if source.relative_to(workspace).as_posix() in tracked:
+                          raise ValueError('Compiled Java artifacts must not replace tracked files.')
+                      count += 1
+              if not count:
+                  raise ValueError('Declared Java output directory has no required bytecode/library files.')
+          # Generate the same scanner properties formerly reconstructed after artifact transfer.
+          # Paths remain relative because build and scan now use the same workspace.
+          java_properties = {'binaries': 'sonar.java.binaries', 'test-binaries': 'sonar.java.test.binaries',
+                             'libraries': 'sonar.java.libraries', 'test-libraries': 'sonar.java.test.libraries'}
+          generated = workspace / 'sonar-project.coverage.generated.properties'
+          if generated.is_symlink():
+              raise ValueError('Generated scanner properties cannot be a symbolic link.')
+          with generated.open('a') as settings:
+              for kind, key in java_properties.items():
+                  paths = [entry['path'] + ('/**/*.jar' if kind.endswith('libraries') else '')
+                           for entry in declared_java_roots if entry['kind'] == kind]
+                  if paths:
+                      settings.write('\n' + key + '=' + ','.join(paths))
+              settings.write('\nsonar.java.source=' + os.environ['JAVA_VERSION'].split('.')[0])
+              settings.write('\nsonar.java.jdkHome=' + os.environ['JAVA_HOME'] + '\n')
+          PYJAVA
 
       - name: Apply and validate scanner settings
         env:
-          EXPECTED_HOST: ${{ needs.identity.outputs.host-url }}
+          EXPECTED_HOST: ${{ steps.sonar-identity.outputs.host_url }}
+          SONAR_PROJECT_KEY: ${{ steps.sonar-identity.outputs.project_key }}
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -1087,8 +810,8 @@ jobs:
               text += '\n' + generated.read_text()
           parsed = dict(properties(text))
           for key, value in properties(text):
-              # Executables, JVM arguments, proxy/trust-store settings and scanner state cannot be
-              # controlled by data produced on the runner that executed pull-request code.
+              # Reject settings that redirect scanner execution or credentials. This check protects
+              # the expected configuration even though preparation shares this runner.
               if re.search(r'^sonar\.(scanner\.|nodejs\.|javascript\.node|login$|token$|password$|userHome$)', key) or re.search(r'(^|\.)sonar\.(projectBaseDir|working\.directory)$', key) or re.search(r'^(https?\.|socks|javax\.net\.ssl\.|java\.)', key):
                   raise SystemExit('Refused scanner override: ' + key)
               if key == 'sonar.host.url' and host(value) != os.environ['EXPECTED_HOST']:
@@ -1099,19 +822,6 @@ jobs:
               raise SystemExit('Scanner identity is missing.')
           settings.write_text(text)
           PY
-
-      - name: Keep build tools out of analysis
-        run: |
-          set -euo pipefail
-          # The scanner can read dependency declarations, but no package manager/build command may
-          # execute repository code on the runner receiving the Sonar credential.
-          shims="$RUNNER_TEMP/sonar-no-build-tools"
-          mkdir -p "$shims"
-          for tool in cargo cargo-clippy clippy-driver rustc rustup npm npx pnpm yarn corepack bun; do
-            printf '#!/bin/sh\necho "Build tools are unavailable in isolated Sonar analysis." >&2\nexit 127\n' > "$shims/$tool"
-            chmod +x "$shims/$tool"
-          done
-          echo "$shims" >> "$GITHUB_PATH"
 
       - name: Require SONAR_TOKEN
         env:
@@ -1140,12 +850,12 @@ jobs:
             -Dsonar.pullrequest.branch=${{ inputs.pull-request-branch }}
             -Dsonar.pullrequest.base=${{ inputs.pull-request-base }}
             -Dsonar.scm.revision=${{ inputs.scm-revision }}
-            -Dsonar.host.url=${{ needs.identity.outputs.host-url }}
+            -Dsonar.host.url=${{ steps.sonar-identity.outputs.host_url }}
             -Dsonar.qualitygate.wait=false
             -Dsonar.javascript.node.maxspace=${{ inputs.sonar-node-max-space }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       - name: SonarQube Scan (pull request, retry)
         if: inputs.use-pull-request-scan && steps.scan-pr.outcome == 'failure'
@@ -1156,12 +866,12 @@ jobs:
             -Dsonar.pullrequest.branch=${{ inputs.pull-request-branch }}
             -Dsonar.pullrequest.base=${{ inputs.pull-request-base }}
             -Dsonar.scm.revision=${{ inputs.scm-revision }}
-            -Dsonar.host.url=${{ needs.identity.outputs.host-url }}
+            -Dsonar.host.url=${{ steps.sonar-identity.outputs.host_url }}
             -Dsonar.qualitygate.wait=false
             -Dsonar.javascript.node.maxspace=${{ inputs.sonar-node-max-space }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       - name: SonarQube Scan (branch)
         id: scan-branch
@@ -1171,12 +881,12 @@ jobs:
         with:
           args: >-
             -Dsonar.branch.name=${{ inputs.branch-name }}
-            -Dsonar.host.url=${{ needs.identity.outputs.host-url }}
+            -Dsonar.host.url=${{ steps.sonar-identity.outputs.host_url }}
             -Dsonar.qualitygate.wait=false
             -Dsonar.javascript.node.maxspace=${{ inputs.sonar-node-max-space }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       - name: SonarQube Scan (branch, retry)
         if: ${{ !inputs.use-pull-request-scan && steps.scan-branch.outcome == 'failure' }}
@@ -1184,12 +894,12 @@ jobs:
         with:
           args: >-
             -Dsonar.branch.name=${{ inputs.branch-name }}
-            -Dsonar.host.url=${{ needs.identity.outputs.host-url }}
+            -Dsonar.host.url=${{ steps.sonar-identity.outputs.host_url }}
             -Dsonar.qualitygate.wait=false
             -Dsonar.javascript.node.maxspace=${{ inputs.sonar-node-max-space }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
 
       - name: Resolve Sonar issue gate scope
         id: issue-gate-scope
@@ -1214,7 +924,7 @@ jobs:
         id: sonar-ce-wait
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
         run: |
           set -euo pipefail
 
@@ -1264,8 +974,9 @@ jobs:
       - name: SonarQube Issue Gate
         if: steps.issue-gate-scope.outputs.effective != 'off'
         env:
+          SONAR_PROJECT_KEY: ${{ steps.sonar-identity.outputs.project_key }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
           USE_PULL_REQUEST_SCAN: ${{ inputs.use-pull-request-scan }}
           SONAR_PULL_REQUEST: ${{ inputs.pull-request-key }}
           SONAR_BRANCH_NAME: ${{ inputs.branch-name }}
@@ -1361,8 +1072,9 @@ jobs:
         # The API-only step can still report hotspots after an issue-gate failure; it executes no repo code.
         if: ${{ !cancelled() && steps.sonar-ce-wait.outputs.analysis_id != '' && inputs.enforce-zero-unreviewed-hotspots }}
         env:
+          SONAR_PROJECT_KEY: ${{ steps.sonar-identity.outputs.project_key }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
           USE_PULL_REQUEST_SCAN: ${{ inputs.use-pull-request-scan }}
           SONAR_PULL_REQUEST: ${{ inputs.pull-request-key }}
           SONAR_BRANCH_NAME: ${{ inputs.branch-name }}
@@ -1432,8 +1144,9 @@ jobs:
         # Read-only, so it also runs when the issue gate already failed.
         if: ${{ !cancelled() && steps.sonar-ce-wait.outputs.analysis_id != '' }}
         env:
+          SONAR_PROJECT_KEY: ${{ steps.sonar-identity.outputs.project_key }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}
           ANALYSIS_ID: ${{ steps.sonar-ce-wait.outputs.analysis_id }}
           USE_PULL_REQUEST_SCAN: ${{ inputs.use-pull-request-scan }}
           SONAR_PULL_REQUEST: ${{ inputs.pull-request-key }}
@@ -1482,4 +1195,4 @@ jobs:
           pollingTimeoutSec: 600
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ needs.identity.outputs.host-url }}
+          SONAR_HOST_URL: ${{ steps.sonar-identity.outputs.host_url }}

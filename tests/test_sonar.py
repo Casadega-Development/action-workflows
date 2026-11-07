@@ -1,12 +1,10 @@
 """Exercise the actual reusable-workflow scripts against offline API and hostile data fixtures."""
-import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -183,148 +181,33 @@ class WorkflowScripts(unittest.TestCase):
                 (self.workspace / 'sonar-project.coverage.generated.properties').write_text(override + '\n')
                 self.assertNotEqual(self.execute('Apply and validate scanner settings').returncode, 0)
 
-    def archive(self, name, members):
-        """Construct exact malicious or benign tar members without ever extracting them in the test."""
-        handoff = self.runner / 'sonar-handoff'
-        handoff.mkdir(exist_ok=True)
-        with tarfile.open(handoff / name, 'w:gz') as archive:
-            for path, kind, value in members:
-                entry = tarfile.TarInfo(path)
-                if kind == 'file':
-                    data = value.encode()
-                    entry.size = len(data)
-                    archive.addfile(entry, io.BytesIO(data))
-                else:
-                    entry.type = tarfile.SYMTYPE if kind == 'link' else tarfile.LNKTYPE
-                    entry.linkname = value
-                    archive.addfile(entry)
-        (handoff / 'manifest.json').write_text(json.dumps({'revision': 'a' * 40, 'workspace': '/old/runner'}))
+    def test_single_job_keeps_identity_gate_and_pinned_scan_actions(self):
+        """All steps share one checkout while authority is selected before project code runs."""
+        self.assertIn('  sonarqube:\n', SOURCE)
+        self.assertNotIn('  prepare:\n', SOURCE)
+        self.assertNotIn('  identity:\n', SOURCE)
+        self.assertLess(SOURCE.index('Resolve committed SonarQube identity'),
+                        SOURCE.index('Resolve Node dependency installation'))
+        self.assertLess(SOURCE.index('Install locked pnpm dependencies'),
+                        SOURCE.index('SonarQube Scan (branch)'))
+        self.assertNotIn('sonar-handoff', SOURCE)
+        self.assertIn("!cancelled() && steps.sonar-ce-wait.outputs.analysis_id", SOURCE)
+        self.assertEqual(len(re.findall(r'uses: SonarSource/sonarqube-scan-action@[0-9a-f]{40}', SOURCE)), 4)
+        self.assertEqual(SOURCE.count('-Dsonar.javascript.node.maxspace=${{ inputs.sonar-node-max-space }}'), 4)
+        self.assertEqual(SOURCE.count('persist-credentials: false'), 2)
+        self.assertTrue(all(re.search(r'@[0-9a-f]{40}(?:\s|$)', line)
+                            for line in SOURCE.splitlines() if 'uses: ' in line))
 
-    def test_handoff_relocates_reports_and_preserves_confined_dependency_links(self):
-        """Legitimate pnpm-like links stay usable, while reports remain ordinary non-executable data."""
-        self.archive('inputs.tar.gz', [('coverage/lcov.info', 'file', 'SF:/old/runner/src/a.ts\n')])
-        self.archive('modules.tar.gz', [('node_modules/.pnpm/pkg/index.d.ts', 'file', 'export {};'),
-                                       ('node_modules/pkg', 'link', '.pnpm/pkg')])
-        result = self.execute('Unpack validated analysis data')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.workspace / 'coverage/lcov.info').read_text(), f'SF:{self.workspace}/src/a.ts\n')
-        self.assertEqual((self.workspace / 'node_modules/pkg/index.d.ts').read_text(), 'export {};')
-
-    def test_handoff_rejects_traversal_links_hardlinks_source_overwrite_and_wrong_revision(self):
-        """Each independent hostile archive must fail before it can write outside the checkout."""
-        for member in [('../escape.info', 'file', 'bad'), ('/tmp/escape.info', 'file', 'bad'),
-                       ('coverage/lcov.info', 'link', '/tmp/escape'), ('coverage/lcov.info', 'hardlink', 'sonar-project.properties'),
-                       ('sonar-project.properties', 'file', 'bad')]:
-            with self.subTest(member=member):
-                self.archive('inputs.tar.gz', [member])
-                self.archive('modules.tar.gz', [])
-                self.assertNotEqual(self.execute('Unpack validated analysis data').returncode, 0)
-        for target in ('/tmp/escape', '../../escape'):
-            self.archive('inputs.tar.gz', [])
-            self.archive('modules.tar.gz', [('node_modules/pkg', 'link', target)])
-            self.assertNotEqual(self.execute('Unpack validated analysis data').returncode, 0)
-        self.env['EXPECTED_REVISION'] = 'b' * 40
-        self.assertNotEqual(self.execute('Unpack validated analysis data').returncode, 0)
-        self.assertFalse((self.root / 'escape.info').exists())
-
-    def test_failed_preparation_is_a_failed_scan_and_hosted_runner_is_required(self):
-        """Skipped/cancelled/failed prerequisites may never be reported as a successful analysis."""
-        self.env['IDENTITY_RESULT'] = 'success'
-        for outcome in ('failure', 'skipped', 'cancelled', ''):
-            self.env['PREPARE_RESULT'] = outcome
-            self.assertNotEqual(self.execute('Require prepared analysis').returncode, 0)
-        self.env.update(PREPARE_RESULT='success', RUNNER_ENVIRONMENT='github-hosted', RUNNER_OS='Linux')
-        self.assertEqual(self.execute('Require prepared analysis').returncode, 0)
+    def test_prerequisite_and_runner_policy_fail_closed(self):
+        """Do not scan when the caller reports failure or a non-hosted runner is selected."""
+        self.env.update(PREREQUISITE_RESULT='success', NODE_MAX_SPACE='4096',
+                        RUNNER_ENVIRONMENT='github-hosted', RUNNER_OS='Linux')
+        self.assertEqual(self.execute('Require successful prerequisite').returncode, 0)
         self.assertEqual(self.execute('Require disposable Linux runner').returncode, 0)
+        self.env['PREREQUISITE_RESULT'] = 'failure'
+        self.assertNotEqual(self.execute('Require successful prerequisite').returncode, 0)
         self.env['RUNNER_ENVIRONMENT'] = 'self-hosted'
         self.assertNotEqual(self.execute('Require disposable Linux runner').returncode, 0)
-
-    def test_job_structure_preserves_the_credential_boundary_and_immutable_actions(self):
-        """Static orchestration assertions complement executable guards without imitating their logic."""
-        preparation = SOURCE.split('  prepare:\n', 1)[1].split('  sonarqube:\n', 1)[0]
-        scan = SOURCE.split('  sonarqube:\n', 1)[1]
-        self.assertNotIn('secrets.SONAR_TOKEN', preparation)
-        self.assertNotIn('pre-sonar-command', scan)
-        self.assertNotIn('npm ci', scan)
-        self.assertIn('if: ${{ !cancelled() }}', scan)
-        self.assertIn('!cancelled() && steps.sonar-ce-wait.outputs.analysis_id', scan)
-        self.assertEqual(len(re.findall(r'uses: SonarSource/sonarqube-scan-action@[0-9a-f]{40}', scan)), 4)
-        self.assertEqual(scan.count('-Dsonar.javascript.node.maxspace=${{ inputs.sonar-node-max-space }}'), 4)
-        self.assertEqual(SOURCE.count('persist-credentials: false'), 4)
-        self.assertTrue(all(re.search(r'@[0-9a-f]{40}(?:\s|$)', line) for line in SOURCE.splitlines() if 'uses: ' in line))
-
-    def test_packaging_round_trip_transfers_only_reports_and_dependency_data(self):
-        """Actual preparation output must preserve analysis inputs without bundling arbitrary code/secrets."""
-        for name, data in [('coverage/lcov.info', 'SF:' + str(self.workspace) + '/src/a.ts\n'),
-                           ('src/new.ts', 'throw new Error("never execute");'), ('secret.json', '{"private":"fixture"}'),
-                           ('tracked.xml', 'tracked fixture'), ('node_modules/pkg/index.d.ts', 'export {};')]:
-            target = self.workspace / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(data)
-        # Git is only asked for tracked names; this fixture exposes the exact documented -z boundary.
-        (self.bin / 'git').write_text('#!/bin/sh\nprintf "sonar-project.properties\\0tracked.xml\\0"\n')
-        (self.bin / 'git').chmod(0o755)
-        result = self.execute('Package analysis data')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        with tarfile.open(self.runner / 'sonar-handoff/inputs.tar.gz') as archive:
-            self.assertEqual(archive.getnames(), ['coverage/lcov.info'])
-        with tarfile.open(self.runner / 'sonar-handoff/modules.tar.gz') as archive:
-            self.assertIn('node_modules/pkg/index.d.ts', archive.getnames())
-        analysis = self.root / 'analysis'
-        analysis.mkdir()
-        (analysis / 'sonar-project.properties').write_text(self.settings.read_text())
-        self.workspace = analysis
-        self.assertEqual(self.execute('Unpack validated analysis data').returncode, 0)
-        self.assertEqual((analysis / 'coverage/lcov.info').read_text(), f'SF:{analysis}/src/a.ts\n')
-        self.assertFalse((analysis / 'src/new.ts').exists())
-        self.assertFalse((analysis / 'secret.json').exists())
-
-    def test_preparation_materializes_hardlinked_files_without_following_dependency_symlinks(self):
-        """pnpm's shared inodes must transfer as regular bytes; hostile archive links stay rejected."""
-        modules = self.workspace / 'node_modules'
-        modules.mkdir()
-        original = modules / 'original.d.ts'
-        original.write_text('export interface Reviewed {}')
-        os.link(original, modules / 'same-inode.d.ts')
-        (modules / 'alias.d.ts').symlink_to('original.d.ts')
-        (self.bin / 'git').write_text('#!/bin/sh\nprintf "sonar-project.properties\\0"\n')
-        (self.bin / 'git').chmod(0o755)
-        self.assertEqual(self.execute('Package analysis data').returncode, 0)
-        with tarfile.open(self.runner / 'sonar-handoff/modules.tar.gz') as archive:
-            self.assertTrue(archive.getmember('node_modules/original.d.ts').isfile())
-            self.assertTrue(archive.getmember('node_modules/same-inode.d.ts').isfile())
-            self.assertTrue(archive.getmember('node_modules/alias.d.ts').issym())
-        analysis = self.root / 'analysis'
-        analysis.mkdir()
-        (analysis / 'sonar-project.properties').write_text(self.settings.read_text())
-        self.workspace = analysis
-        result = self.execute('Unpack validated analysis data')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((analysis / 'node_modules/same-inode.d.ts').read_text(), 'export interface Reviewed {}')
-
-    def test_placed_dependency_links_cannot_escape_through_checked_out_links(self):
-        """A link safe inside staging can become unsafe after placement; check the final real target."""
-        outside = self.root / 'outside'
-        outside.mkdir()
-        (outside / 'sentinel').write_text('untouched')
-        (self.workspace / 'vendor').symlink_to(outside, target_is_directory=True)
-        self.archive('inputs.tar.gz', [])
-        self.archive('modules.tar.gz', [('node_modules/pkg', 'link', '../vendor')])
-        self.assertNotEqual(self.execute('Unpack validated analysis data').returncode, 0)
-        self.assertEqual((outside / 'sentinel').read_text(), 'untouched')
-
-    def test_reports_cannot_write_through_dangling_checked_out_links(self):
-        """A nonexistent external target still escapes if a dangling destination link is followed."""
-        outside = self.root / 'outside'
-        outside.mkdir()
-        coverage = self.workspace / 'coverage'
-        coverage.mkdir()
-        leaked = outside / 'leaked.info'
-        (coverage / 'lcov.info').symlink_to(leaked)
-        self.archive('inputs.tar.gz', [('coverage/lcov.info', 'file', 'untrusted report')])
-        self.archive('modules.tar.gz', [])
-        self.assertNotEqual(self.execute('Unpack validated analysis data').returncode, 0)
-        self.assertFalse(leaked.exists())
 
     def test_missing_task_metadata_fails_and_hotspot_diagnostics_name_locations(self):
         """Absence cannot count as processed analysis, while read-only diagnostics retain actionable code locations."""
