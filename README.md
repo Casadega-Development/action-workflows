@@ -33,13 +33,13 @@ Configure these on the **calling** repository. This repo has no Sonar credential
 
 | Name              | Kind            | Purpose                                                                                                                                                                                                                   |
 | ----------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SONAR_TOKEN`     | Secret          | **Project analysis token** (My Account → Security → Generate Tokens → type Project). A user token is for local CLI/precheck; CI must be a project analysis token (or a user token with Execute Analysis on that project). |
+| `SONAR_TOKEN`     | Secret          | Project analysis token or a dedicated service-account user token with the project permissions needed by the scanner and configured API gates. |
 | `NODE_AUTH_TOKEN` | Optional secret | Package-registry read token used only while restoring dependencies for analysis. Required when the locked dependency graph contains private packages that the caller's `GITHUB_TOKEN` cannot read.                        |
 
 The caller must check in `sonar-project.properties` with non-empty `sonar.host.url` and
 `sonar.projectKey` values. Commit that identity on the PR base/default branch before enabling scans:
-the generic scan's identity job reads the PR base commit, or the default branch for other events,
-on a runner that never executes repository code. The analyzed head must retain that same host and project. A legacy
+the generic scan reads the PR base commit, or the default branch for other events,
+before running repository code. The analyzed head must retain that same host and project. A legacy
 `SONAR_HOST_URL` repository variable is compared for migration diagnostics and ignored when it
 disagrees, so ambient GitHub configuration cannot redirect source to another SonarQube server.
 
@@ -79,27 +79,21 @@ shared workflow does not publish a second GitHub Actions comment and therefore d
 The scan-after-tests orchestrator additionally requires `pull-requests: read` so it can recover the
 pull-request number and branch metadata from the completed test run.
 
-## Isolated preparation and analysis
+## Preparation and analysis
 
-The reusable scan resolves one immutable source commit, then runs preparation and analysis in
-separate jobs. Preparation restores dependencies, downloads coverage, and runs `pre-sonar-command`
-without `SONAR_TOKEN`. Analysis checks out the resolved commit without persisted checkout
-credentials and consumes the preparation artifact as untrusted data. Only ordinary reports, the
-declared generated coverage properties file, and confined `node_modules` data are accepted by default. Explicit Java opt-in adds only the
-declared bytecode/library directories described below. Archive
-traversal, hard links, source-file replacement, and links escaping through either the artifact or
-the checked-out tree fail validation. Package-manager commands are blocked in analysis; no repository build step runs there. The
-separate .NET workflow has a different, deliberately narrower trust contract described below.
+The generic scan resolves the committed SonarQube identity and checks out the requested revision
+before installing dependencies, downloading coverage, running any `pre-sonar-command`, and scanning
+in one GitHub-hosted Linux job. Checkout credentials are not persisted, actions remain pinned, and
+scanner settings are validated after generated properties are applied.
 
-Both jobs require **GitHub-hosted Linux runners**. `runner-labels-json` can select a larger hosted
-Linux runner; persistent self-hosted runners are rejected because they do not establish the required
-separation. The artifact has a unique name per invocation and one-day retention. A failed identity
-or preparation job explicitly fails the existing `sonarqube` job instead of skipping it.
+Preparation and the token-bearing scan share a runner. Dependency install scripts or preparation
+commands can influence later steps and potentially access the Sonar token. Use a dedicated service
+account with only the project permissions required by the scanner and configured gates, and assess
+this trust model before using the workflow with untrusted code.
 
-`pre-sonar-command` may generate `sonar-project.coverage.generated.properties` and untracked LCOV,
-`.info`, XML, or JSON-under-`coverage` reports. It cannot transfer arbitrary generated application
-code or overwrite checked-out files in analysis. Absolute LCOV source paths are relocated to the
-analysis workspace. The final properties are checked again after generated properties are applied.
+The scanner reads dependencies and reports directly from the workspace; the workflow no longer
+packages and transfers them between jobs. `runner-labels-json` may select a larger hosted Linux
+runner. The separate .NET workflow retains its own trust contract described below.
 
 The shared workflow cannot repair a caller that is itself skipped after `needs: test` fails. Callers
 should run the reusable job with `if: ${{ !cancelled() }}` (combined with their fork policy) and pass
@@ -220,8 +214,8 @@ jobs:
 ## Repository validation
 
 Run `actionlint` and `python3 -m unittest discover -s tests -v` from this repository. The Python suite
-uses only the standard library and executes the actual embedded gate and isolation scripts with
-synthetic HTTP responses and hostile archive/property fixtures. It never contacts SonarQube or uses
+uses only the standard library and executes the actual embedded gate and scanner-settings scripts with
+synthetic HTTP responses and hostile property fixtures. It never contacts SonarQube or uses
 real credentials. The local CI workflow runs both checks on PRs and pushes to `main`.
 
 ### Explicit unreviewed-hotspot policy
@@ -232,13 +226,11 @@ so existing server quality-gate policies remain unchanged. This API gate checks 
 hotspots in the selected PR or branch independently of ordinary issue scope and server thresholds.
 It uses bounded requests, two consecutive empty reads to pass, and three identical nonempty reads
 to fail early. Malformed counts, inconsistent first-page results, and request failures block.
-Failures list up to 100 hotspot locations. The gate runs in the isolated analysis job without
-executing repository-owned code, including after an ordinary issue-gate failure.
+Failures list up to 100 hotspot locations. The gate runs after analysis, including after an ordinary issue-gate failure.
 
 ## Opt-in Java and Ant analysis
 
-The generic scan can now transfer Java bytecode without changing its existing report/dependency
-contract. Both new inputs default to the empty string and are forwarded by the after-tests workflow:
+The generic scan can analyze Java bytecode produced in its workspace. Both new inputs default to the empty string and are forwarded by the after-tests workflow:
 
 | Input | Meaning |
 | --- | --- |
@@ -256,8 +248,7 @@ Allowed `kind` values map to the scanner as follows:
 
 At least one production `binaries` directory is required. Every declared directory must contain at
 least one file of its declared type; missing bytecode fails the scan. Paths are repository-relative,
-non-overlapping literal directories, never globs. The trusted workflow configures both preparation
-and analysis with the selected JDK, and sets `sonar.java.source` and `sonar.java.jdkHome` from that
+non-overlapping literal directories, never globs. The workflow configures the shared preparation and analysis job with the selected JDK, and sets `sonar.java.source` and `sonar.java.jdkHome` from that
 selection. Library directory paths become recursive JAR patterns for the scanner.
 
 For example, add these inputs to the existing generic scan caller, adjusting paths and the reviewed
@@ -278,13 +269,9 @@ preparation runner, or be installed by the consumer's preparation command. No An
 migration is required. The ordinary required tests remain authoritative; `pre-sonar-command` is
 preparation for analysis, not a substitute for them.
 
-The separate Java archive is bound to the same immutable source revision as other analysis data.
-Packaging and extraction validate the declaration independently. Symlinks, archive hardlinks,
-traversal, unexpected file types, undeclared roots, and overwriting checked-out files are rejected.
-The Java archive cannot supply scripts or expand its own allowed paths. Compiled files must be
-untracked output, so versioned vendor JARs must be copied into the declared build output directory.
-Other files in those directories are not transferred. This intentionally remains a data-only
-handoff; the scanner job does not run Ant, tests, or application classes.
+Before analysis, the workflow validates the declared directories and requires generated bytecode
+or libraries of the expected types. Symlinks, unsafe paths, overlapping roots, and tracked compiled
+files are rejected. The scanner reads the validated outputs from the same workspace as the build.
 
 [Sonar's Java documentation](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/languages/java)
 requires compiled bytecode for multi-file projects and describes the JDK and binary-path settings.
@@ -440,13 +427,13 @@ required:
     required-jobs-json: '["check","tests","sonarqube"]'
 ```
 
-Existing generic workflow names, inputs, defaults, and job identifiers retain their behavior when
-Java opt-in is absent. Consumers pinned to commits adopt these additions through a reviewed pin
+The generic workflow retains its caller inputs and Sonar check job identifier; preparation and
+analysis now share one runner and therefore have the trust model described above. Consumers pinned to commits adopt these additions through a reviewed pin
 update. Consumers following `@main` receive repository changes immediately; migrating those callers
 to reviewed immutable pins is a separate adoption task. No server quality gate, profile assignment,
 branch requirement, or consuming repository is changed by this catalog update.
 
-The test suite additionally executes the native input guards, restore/build/test contracts,
-required-result gate, and hostile Java artifacts offline. A JDK smoke test compiles an assertion,
-transfers the resulting class/JAR data, and executes the transferred class. No test contacts Sonar
+The test suite additionally exercises the native input guards, restore/build/test contracts,
+required-result gate, and Java input validation offline. A JDK smoke test compiles and executes
+a class using the same build output inspected by the scan. No test contacts Sonar
 or uses real credentials; GitHub execution and a live .NET scan remain rollout validation steps.

@@ -62,7 +62,7 @@ on:
         description: >-
           Opt-in JSON array of {"path":"repo-relative directory","kind":"binaries|test-binaries|libraries|test-libraries"}.
           Each directory must contain untracked .class files (binaries) or .jar files (libraries).
-          At least one binaries directory is required. Empty disables Java artifact transfer.
+          At least one binaries directory is required. Empty disables Java artifact setup.
         required: false
         type: string
         default: ""
