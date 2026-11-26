@@ -14,9 +14,9 @@ WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/sonar-scan.y
 SOURCE = WORKFLOW.read_text()
 
 
-def shell(name):
+def shell(name, source=SOURCE):
     """Extract a literal named step, preserving its real shell/Python rather than copying logic."""
-    section = SOURCE.split('      - name: ' + name + '\n', 1)[1]
+    section = source.split('      - name: ' + name + '\n', 1)[1]
     body = section.split('        run: |\n', 1)[1]
     lines = []
     for line in body.splitlines():
@@ -47,9 +47,9 @@ class WorkflowScripts(unittest.TestCase):
         self.settings = self.workspace / 'sonar-project.properties'
         self.settings.write_text('sonar.host.url=https://sonar.example.test\nsonar.projectKey=fixture\n')
 
-    def execute(self, name, timeout=10):
+    def execute(self, name, timeout=10, source=SOURCE):
         """Run the checked-in step with literal fixture values and a bounded local subprocess."""
-        return subprocess.run(['bash', '-c', shell(name)], cwd=self.workspace, env=self.env, text=True,
+        return subprocess.run(['bash', '-c', shell(name, source)], cwd=self.workspace, env=self.env, text=True,
                               capture_output=True, timeout=timeout)
 
     def fake_api(self, responses):
@@ -143,6 +143,7 @@ class WorkflowScripts(unittest.TestCase):
                 recorded = [json.loads(line) for line in calls.read_text().splitlines()]
                 self.assertEqual(len(recorded), expected_reads)
                 self.assertIn('pullRequest=12' if pr == 'true' else 'branch=main', recorded[0])
+                self.assertEqual([arg for arg in recorded[0] if arg.startswith('project')], ['project=fixture'])
                 self.assertIn('status=TO_REVIEW', recorded[0])
                 self.assertIn('--connect-timeout', recorded[0])
                 self.assertIn('--max-time', recorded[0])
@@ -218,6 +219,125 @@ class WorkflowScripts(unittest.TestCase):
         result = self.execute('SonarQube Quality Gate Diagnostics')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('fixture:src/a.ts:7', Path(self.env['GITHUB_STEP_SUMMARY']).read_text())
+        request = json.loads(Path(self.env['CALLS']).read_text().splitlines()[1])
+        self.assertEqual([arg for arg in request if arg.startswith('project')], ['project=fixture'])
+
+    def test_scanner_launcher_and_engine_use_the_verified_store(self):
+        """Run each real setup script and reject unreadable, empty, and compromised stores."""
+        java_home = self.root / 'pinned scanner java'
+        java_bin = java_home / 'bin'
+        store = java_home / 'lib/security/cacerts'
+        java_bin.mkdir(parents=True)
+        store.parent.mkdir(parents=True)
+        for tool, script in (('java', 'exit 0'), ('keytool', 'printf "%s\\n" "$FIXTURE_CERTS"')):
+            executable = java_bin / tool
+            executable.write_text('#!/bin/sh\n' + script + '\n')
+            executable.chmod(0o755)
+        output = self.root / 'scanner-env'
+        self.env.update(JAVA_HOME=str(java_home), GITHUB_ENV=str(output), JAVA_TOOL_OPTIONS='-Dlauncher=keep',
+                        SONAR_SCANNER_JAVA_OPTS='-Xmx2g -Dengine=keep')
+        blocked_fingerprints = (
+            '86:A1:EC:BA:08:9C:4A:8D:3B:BE:27:34:C6:12:BA:34:1D:81:3E:04:3C:F9:E8:A8:62:CD:5C:57:A3:6B:BE:6B',
+            'D7:A7:A0:FB:5D:7E:27:31:D7:71:E9:48:4E:BC:DE:F7:1D:5F:0C:3E:0A:29:48:78:2B:C8:3E:E0:EA:69:9E:F4',
+        )
+        dotnet = (WORKFLOW.parent / 'sonar-dotnet.yml').read_text()
+        # Reusable workflows execute from the caller checkout, so keep these
+        # inline scanner guards identical without a second checkout.
+        self.assertEqual(shell('Configure Sonar scanner JVM trust'), shell('Configure Sonar scanner JVM trust', dotnet))
+        for source in (SOURCE, dotnet):
+            store.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
+            self.assertNotEqual(self.execute('Configure Sonar scanner JVM trust', source=source).returncode, 0)
+            store.write_text('fixture store')
+            for fingerprints in ('no certificates', *('SHA256: ' + blocked for blocked in blocked_fingerprints)):
+                self.env['FIXTURE_CERTS'] = fingerprints
+                self.assertNotEqual(self.execute('Configure Sonar scanner JVM trust', source=source).returncode, 0)
+                self.assertFalse(output.exists())
+            self.env['FIXTURE_CERTS'] = 'SHA256: AA:BB:CC'
+            result = self.execute('Configure Sonar scanner JVM trust', source=source)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            flags = f'-Djavax.net.ssl.trustStore="{store}" -XX:-UseBASE64Intrinsics'
+            self.assertEqual(dict(line.split('=', 1) for line in output.read_text().splitlines()), {
+                'JAVA_TOOL_OPTIONS': '-Dlauncher=keep ' + flags,
+                'SONAR_SCANNER_JAVA_OPTS': '-Xmx2g -Dengine=keep ' + flags,
+                'SONAR_SCANNER_SKIP_JRE_PROVISIONING': 'true',
+                'SONAR_SCANNER_JAVA_EXE_PATH': str(java_bin / 'java'),
+            })
+        self.assertGreater(SOURCE.index('Configure Sonar scanner JVM trust'), SOURCE.index('Validate Java analysis inputs'))
+        self.assertEqual(SOURCE.count('Configure Sonar scanner JVM trust'), 1)
+
+    def rescan(self, run_event='pull_request', recorded=None, related=None, invocation='workflow_dispatch'):
+        """Run the real rescan resolver against a synthetic run and paginated commit associations."""
+        output = self.root / 'rescan-output'
+        output.write_text('')
+        calls = self.root / 'rescan-calls'
+        calls.write_text('')
+        self.env.update(EVENT_NAME=invocation, INPUT_TEST_RUN_ID='99', WORKFLOW_RUN_ID='99',
+                        GITHUB_REPOSITORY='example/project', GITHUB_OUTPUT=str(output), CALLS=str(calls),
+                        RUN_PAYLOAD=json.dumps({'event': run_event, 'head_branch': 'fix/example', 'head_sha': 'a' * 40,
+                                                'head_repository': {'id': 13}, 'repository': {'id': 13},
+                                                'pull_requests': recorded or []}),
+                        COMMIT_PRS=json.dumps(related or [[]]))
+        gh = self.bin / 'gh'
+        gh.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''
+            import os, sys
+            from pathlib import Path
+            route = sys.argv[-1]
+            with Path(os.environ['CALLS']).open('a') as output:
+                print(route, file=output)
+            if sys.argv[1:] == ['api', 'repos/example/project/actions/runs/99']:
+                print(os.environ['RUN_PAYLOAD'])
+            elif sys.argv[1:4] == ['api', '--paginate', '--slurp'] and route == (
+                'repos/example/project/commits/' + 'a' * 40 + '/pulls?per_page=100'
+            ):
+                print(os.environ['COMMIT_PRS'])
+            else:
+                sys.exit('Unexpected GitHub route: ' + route)
+        '''))
+        gh.chmod(0o755)
+        result = self.execute('Resolve from workflow_run or test-run-id',
+                              source=(WORKFLOW.parent / 'sonar-scan-after-tests.yml').read_text())
+        return result, dict(line.split('=', 1) for line in output.read_text().splitlines()), calls.read_text().splitlines()
+
+    @staticmethod
+    def pull(number, source=13, target=13):
+        """Build matching and misleading associations without relying on names alone."""
+        return {'number': number, 'head': {'ref': 'fix/example', 'repo': {'id': source}},
+                'base': {'ref': 'main', 'repo': {'id': target}}}
+
+    def test_rescan_recovers_the_merged_pull_request_by_tested_sha(self):
+        """An empty run association must resolve the original PR and reuse its exact tested commit."""
+        result, outputs, calls = self.rescan(related=[[self.pull(30, source=14)],
+                                                      [self.pull(28), self.pull(31, target=14)]])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'coverage-run-id': '99', 'checkout-ref': 'a' * 40, 'scm-revision': 'a' * 40,
+                                   'use-pull-request-scan': 'true', 'pull-request-key': '28',
+                                   'pull-request-branch': 'fix/example', 'pull-request-base': 'main'})
+        self.assertEqual(len(calls), 2)
+
+    def test_rescan_uses_unambiguous_run_metadata_and_preserves_branch_runs(self):
+        """Authoritative run metadata requires no extra lookup; a real branch remains branch-scoped."""
+        result, outputs, calls = self.rescan(recorded=[self.pull(28)], invocation='workflow_run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['pull-request-key'], '28')
+        self.assertEqual(len(calls), 1)
+        result, outputs, calls = self.rescan(run_event='push')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['branch-name'], 'fix/example')
+        self.assertEqual(outputs['use-pull-request-scan'], 'false')
+        self.assertEqual(len(calls), 1)
+
+    def test_unresolved_or_ambiguous_pr_never_produces_branch_scan_inputs(self):
+        """Partial or conflicting PR evidence must stop the scanner without publishing any outputs."""
+        for related in ([[]], [[self.pull(28), self.pull(29)]]):
+            with self.subTest(related=related):
+                result, outputs, _ = self.rescan(related=related)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('No unique pull request matches the tested commit', result.stdout)
+                self.assertEqual(outputs, {})
+        result, outputs, _ = self.rescan(run_event='pull_request_target')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outputs, {})
 
 
 if __name__ == '__main__':

@@ -95,6 +95,14 @@ The scanner reads dependencies and reports directly from the workspace; the work
 packages and transfers them between jobs. `runner-labels-json` may select a larger hosted Linux
 runner. The separate .NET workflow retains its own trust contract described below.
 
+Both workflows install a pinned scanner JDK and verify its Java CA store before invoking Sonar.
+The generic workflow sets up scanner Java after caller-selected preparation so the application
+can keep its build JDK. The launcher and engine use the verified store with JRE auto-provisioning
+disabled. The .NET workflow also sets the corresponding scanner properties at `begin`. Keep the
+Java4Shell mitigation until the selected runtime and vendor guidance allow its removal. Review
+changes to the JDK against the [Java4Shell advisory](https://community.sonarsource.com/t/security-advisory-java4shell-workaround-for-sonarqube/191330)
+and [eMudhra scanner guidance](https://docs.sonarsource.com/sonarqube-community-build/server-update-and-maintenance/release-notes/emudhra-certificate-authority-compromise#scanners).
+
 The shared workflow cannot repair a caller that is itself skipped after `needs: test` fails. Callers
 should run the reusable job with `if: ${{ !cancelled() }}` (combined with their fork policy) and pass
 `prerequisite-result: ${{ needs.test.result }}`. Keep an aggregate required test check that runs with
@@ -192,6 +200,11 @@ sonarqube:
 ```
 
 Manual re-scan of a completed test run:
+
+Pull-request runs use the tested commit and the PR recorded on the run. If GitHub omits that
+association, the resolver looks up pull requests by the tested SHA and matches the run's head
+ref and repository identities. This can recover a merged PR. Missing or ambiguous PR evidence
+stops the scan. A genuine branch run keeps its branch scope.
 
 ```yaml
 jobs:
