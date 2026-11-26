@@ -288,6 +288,46 @@ jobs:
           (runner / 'sonar-dotnet-reports').mkdir()
           PY
 
+      - name: Set up pinned Sonar scanner Java
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          # setup-java uses the vendor's SemVer encoding for 21.0.13.1+2.
+          java-version: '21.0.13+100000002.0.LTS'
+          overwrite-settings: false
+
+      - name: Configure Sonar scanner JVM trust
+        run: |
+          set -euo pipefail
+          java_home="${JAVA_HOME:?The pinned scanner Java runtime is required.}"
+          store="$java_home/lib/security/cacerts"
+          if [[ ! -x "$java_home/bin/java" || ! -x "$java_home/bin/keytool" || ! -r "$store" || ! -s "$store" ]]; then
+            echo "::error::The pinned scanner Java runtime and its CA store must be readable."
+            exit 1
+          fi
+
+          # Check certificate fingerprints, since alias names differ across stores and operating
+          # systems. Fail closed before starting a scanner if the selected store is unsafe.
+          fingerprints=$("$java_home/bin/keytool" -list -v -J-Duser.language=en -J-Duser.country=US -keystore "$store" -storepass changeit)
+          if ! grep -Fq 'SHA256:' <<< "$fingerprints"; then
+            echo "::error::The scanner CA store contains no verifiable certificate fingerprints."
+            exit 1
+          fi
+          if grep -Eiq '86:A1:EC:BA:08:9C:4A:8D:3B:BE:27:34:C6:12:BA:34:1D:81:3E:04:3C:F9:E8:A8:62:CD:5C:57:A3:6B:BE:6B|D7:A7:A0:FB:5D:7E:27:31:D7:71:E9:48:4E:BC:DE:F7:1D:5F:0C:3E:0A:29:48:78:2B:C8:3E:E0:EA:69:9E:F4' <<< "$fingerprints"; then
+            echo "::error::The scanner CA store contains a certificate named in SonarSource's eMudhra advisory."
+            exit 1
+          fi
+
+          # The scanner launcher and its analysis engine can each select their own JVM options.
+          # Pin the trusted store for both and retain the vendor's temporary Java4Shell workaround.
+          scanner_options="-Djavax.net.ssl.trustStore=\"$store\" -XX:-UseBASE64Intrinsics"
+          {
+            printf '%s\n' "JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }$scanner_options"
+            printf '%s\n' "SONAR_SCANNER_JAVA_OPTS=${SONAR_SCANNER_JAVA_OPTS:+$SONAR_SCANNER_JAVA_OPTS }$scanner_options"
+            printf '%s\n' "SONAR_SCANNER_SKIP_JRE_PROVISIONING=true"
+            printf '%s\n' "SONAR_SCANNER_JAVA_EXE_PATH=$java_home/bin/java"
+          } >> "$GITHUB_ENV"
+
       - name: Begin .NET analysis
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -312,6 +352,8 @@ jobs:
           arguments = [str(runner / 'sonar-dotnet-tools/dotnet-sonarscanner'), 'begin', '/k:' + config['key'],
                        '/d:sonar.host.url=' + config['host'], '/d:sonar.token=' + os.environ['SONAR_TOKEN'],
                        '/d:sonar.scm.revision=' + os.environ['SOURCE_REVISION'],
+                       '/d:sonar.scanner.skipJreProvisioning=true',
+                       '/d:sonar.scanner.javaExePath=' + os.environ['SONAR_SCANNER_JAVA_EXE_PATH'],
                        '/d:sonar.scanner.scanAll=false',
                        '/d:sonar.cs.opencover.reportsPaths=' + str(runner / 'sonar-dotnet-reports/**/*.opencover.xml'),
                        '/d:sonar.cs.vstest.reportsPaths=' + str(runner / 'sonar-dotnet-reports/**/*.trx')]
@@ -580,7 +622,7 @@ jobs:
           for attempt in $(seq 1 12); do
             hotspots_json=$(curl -fsS --connect-timeout 5 --max-time 15 -u "${SONAR_TOKEN}:" \
               --get "${SONAR_HOST_URL%/}/api/hotspots/search" \
-              --data-urlencode "projectKey=${SONAR_PROJECT_KEY}" \
+              --data-urlencode "project=${SONAR_PROJECT_KEY}" \
               --data-urlencode "status=TO_REVIEW" --data-urlencode "ps=100" "${target[@]}")
             # JSON booleans/strings, negative/fractional counts, missing lists and inconsistent
             # first-page results are unavailable evidence, never proof of a clean analysis.
@@ -651,7 +693,7 @@ jobs:
               target=(--data-urlencode "branch=${SONAR_BRANCH_NAME}")
             fi
             if hotspots_json=$(curl -fsS --connect-timeout 5 --max-time 15 -u "${SONAR_TOKEN}:" --get "${api_base}/hotspots/search" \
-              --data-urlencode "projectKey=${project_key}" --data-urlencode "status=TO_REVIEW" --data-urlencode "ps=100" "${target[@]}"); then
+              --data-urlencode "project=${project_key}" --data-urlencode "status=TO_REVIEW" --data-urlencode "ps=100" "${target[@]}"); then
               hotspots=$(printf '%s' "$hotspots_json" | jq -r '.hotspots[]? | "- \(.vulnerabilityProbability // "-") \(.component):\(.line // "-") \(.message)"')
               echo "Security hotspots to review:"
               printf '%s\n' "$hotspots"

@@ -127,7 +127,8 @@ class NativeWorkflowScripts(unittest.TestCase):
                     'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_OS': 'Linux', 'PROJECT_DIRECTORY': '.',
                     'PROJECT_FILE': 'App.csproj', 'TEST_PROJECTS_JSON': '["Tests/Tests.csproj"]',
                     'BUILD_CONFIGURATION': 'Release', 'ISSUE_GATE_SCOPE': 'all-open',
-                    'GITHUB_OUTPUT': str(self.root / 'output'), 'SONAR_TOKEN': 'synthetic-token'}
+                    'GITHUB_OUTPUT': str(self.root / 'output'), 'SONAR_TOKEN': 'synthetic-token',
+                    'SONAR_SCANNER_JAVA_EXE_PATH': str(self.runner / 'pinned-jdk/bin/java')}
         (self.workspace / '.config').mkdir()
         (self.workspace / '.config/dotnet-tools.json').write_text(json.dumps({'version': 1, 'isRoot': True, 'tools': {
             'dotnet-sonarscanner': {'version': '10.4.1', 'commands': ['dotnet-sonarscanner']}}}))
@@ -347,6 +348,8 @@ class NativeWorkflowScripts(unittest.TestCase):
         self.assertIn('/d:sonar.scm.revision=' + 'a' * 40, calls[0])
         self.assertFalse(any(argument.startswith('/d:sonar.pullrequest.') for argument in calls[0]))
         self.assertIn('/d:sonar.scanner.scanAll=false', calls[0])
+        self.assertIn('/d:sonar.scanner.skipJreProvisioning=true', calls[0])
+        self.assertIn('/d:sonar.scanner.javaExePath=' + self.env['SONAR_SCANNER_JAVA_EXE_PATH'], calls[0])
         self.assertIn('/d:sonar.token=synthetic-token', calls[0])
         self.assertEqual(calls[1], ['end', '/d:sonar.token=synthetic-token'])
         self.assertTrue((self.workspace / '.scannerwork/report-task.txt').is_file())
@@ -439,6 +442,9 @@ class NativeWorkflowScripts(unittest.TestCase):
                     for arguments in scoped:
                         self.assertIn(expected, arguments)
                         self.assertFalse(any(value.startswith(forbidden_prefix) for value in arguments))
+                        if any('/hotspots/search' in value for value in arguments):
+                            self.assertEqual([value for value in arguments if value.startswith('project')],
+                                             ['project=fixture'])
                     if name == 'SonarQube Quality Gate Diagnostics':
                         self.assertIn('https://sonar.example.test/api/qualitygates/project_status?analysisId=exact-analysis',
                                       recorded[0])

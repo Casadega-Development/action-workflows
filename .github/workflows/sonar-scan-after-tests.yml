@@ -129,76 +129,80 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_TEST_RUN_ID: ${{ inputs.test-run-id }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
-          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
-          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
 
           if [ "$EVENT_NAME" = "workflow_run" ]; then
             RUN_ID="$WORKFLOW_RUN_ID"
-            RUN_EVENT="$WORKFLOW_RUN_EVENT"
-            HEAD_SHA="$WORKFLOW_RUN_HEAD_SHA"
-            HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
-          elif [ -n "$INPUT_TEST_RUN_ID" ]; then
-            RUN_ID="$INPUT_TEST_RUN_ID"
-            RUN_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")
-            RUN_EVENT=$(echo "$RUN_JSON" | jq -r '.event')
-            HEAD_SHA=$(echo "$RUN_JSON" | jq -r '.head_sha')
-            HEAD_BRANCH=$(echo "$RUN_JSON" | jq -r '.head_branch')
           else
-            echo "Expected workflow_run event or non-empty test-run-id input." >&2
+            RUN_ID="$INPUT_TEST_RUN_ID"
+          fi
+          if ! [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Expected a numeric GitHub Actions test run ID."
             exit 1
+          fi
+
+          # Read metadata anchored to the original run, even when dispatching a rescan
+          # after the pull request was merged or the head branch was removed.
+          RUN_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")
+          RUN_EVENT=$(jq -er '.event | strings | select(length > 0)' <<< "$RUN_JSON")
+          HEAD_SHA=$(jq -er '.head_sha | strings | select(test("^[0-9a-f]{40}$"))' <<< "$RUN_JSON")
+          HEAD_BRANCH=$(jq -er '.head_branch | strings | select(length > 0)' <<< "$RUN_JSON")
+          git check-ref-format "refs/heads/$HEAD_BRANCH"
+
+          if [ "$RUN_EVENT" = "pull_request_target" ]; then
+            echo "::error::A pull_request_target run does not establish the tested PR head revision."
+            exit 1
+          fi
+
+          if [ "$RUN_EVENT" = "pull_request" ]; then
+            HEAD_REPOSITORY_ID=$(jq -er '.head_repository.id | numbers' <<< "$RUN_JSON")
+            BASE_REPOSITORY_ID=$(jq -er '.repository.id | numbers' <<< "$RUN_JSON")
+
+            # A commit can be associated with several PRs. Match the original head
+            # ref and both repository identities before considering a candidate.
+            match_prs() {
+              jq -c --arg head "$HEAD_BRANCH" --argjson source "$HEAD_REPOSITORY_ID" \
+                --argjson target "$BASE_REPOSITORY_ID" \
+                '[.[] | select(.head.ref == $head and .head.repo.id == $source and .base.repo.id == $target)] | unique_by(.number)'
+            }
+
+            PRS=$(jq -c '.pull_requests // []' <<< "$RUN_JSON" | match_prs)
+            if [ "$(jq 'length' <<< "$PRS")" -ne 1 ]; then
+              # GitHub may omit the PR association on the workflow run. Lookup by
+              # tested SHA can recover a merged PR without guessing by branch name.
+              PRS=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls?per_page=100" \
+                | jq -c 'add // []' | match_prs)
+            fi
+            if [ "$(jq 'length' <<< "$PRS")" -ne 1 ]; then
+              echo "::error::No unique pull request matches the tested commit for run ${RUN_ID}; scan stopped."
+              exit 1
+            fi
+
+            PR_NUMBER=$(jq -er '.[0].number | numbers | tostring | select(test("^[1-9][0-9]*$"))' <<< "$PRS")
+            PR_BASE=$(jq -er '.[0].base.ref | strings | select(length > 0)' <<< "$PRS")
+            git check-ref-format "refs/heads/$PR_BASE"
           fi
 
           {
             echo "coverage-run-id=${RUN_ID}"
             echo "checkout-ref=${HEAD_SHA}"
             echo "scm-revision=${HEAD_SHA}"
-          } >> "$GITHUB_OUTPUT"
-
-          if [ "$RUN_EVENT" = "pull_request" ]; then
-            PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
-              --jq '.pull_requests[0] // empty')
-            if [ -n "$PR_JSON" ] && [ "$PR_JSON" != "null" ]; then
-              {
-                echo "use-pull-request-scan=true"
-                echo "pull-request-key=$(echo "$PR_JSON" | jq -r '.number')"
-                echo "pull-request-branch=$(echo "$PR_JSON" | jq -r '.head.ref')"
-                echo "pull-request-base=$(echo "$PR_JSON" | jq -r '.base.ref')"
-              } >> "$GITHUB_OUTPUT"
+            if [ "$RUN_EVENT" = "pull_request" ]; then
+              echo "use-pull-request-scan=true"
+              echo "pull-request-key=${PR_NUMBER}"
+              echo "pull-request-branch=${HEAD_BRANCH}"
+              echo "pull-request-base=${PR_BASE}"
             else
-              PR_NUMBER=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "$HEAD_BRANCH" \
-                --state open --json number --jq '.[0].number // empty')
-              if [ -z "$PR_NUMBER" ]; then
-                # PR lookup can miss (PR closed/merged between runs, fork branches).
-                # Fall back to a branch-scope scan instead of failing the whole workflow.
-                echo "::warning::Could not resolve PR number for run ${RUN_ID} (branch ${HEAD_BRANCH}); falling back to branch scan"
-                {
-                  echo "use-pull-request-scan=false"
-                  echo "branch-name=${HEAD_BRANCH}"
-                } >> "$GITHUB_OUTPUT"
-              else
-                PR_VIEW=$(gh pr view "$PR_NUMBER" --repo "${GITHUB_REPOSITORY}" --json headRefName,baseRefName)
-                {
-                  echo "use-pull-request-scan=true"
-                  echo "pull-request-key=${PR_NUMBER}"
-                  echo "pull-request-branch=$(echo "$PR_VIEW" | jq -r '.headRefName')"
-                  echo "pull-request-base=$(echo "$PR_VIEW" | jq -r '.baseRefName')"
-                } >> "$GITHUB_OUTPUT"
-              fi
-            fi
-          else
-            {
               echo "use-pull-request-scan=false"
               echo "branch-name=${HEAD_BRANCH}"
-            } >> "$GITHUB_OUTPUT"
-          fi
+            fi
+          } >> "$GITHUB_OUTPUT"
 
   sonarqube:
     name: SonarQube Scan
     needs: resolve
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
     permissions:
       actions: read
       contents: read
